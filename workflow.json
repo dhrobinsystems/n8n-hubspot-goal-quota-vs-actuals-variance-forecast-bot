@@ -1,0 +1,1084 @@
+{
+  "name": "HubSpot Quota vs Actuals Variance Forecast Bot (Safe-by-Default)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Quota vs Actuals: Variance Forecast Bot\n\n**Safe by default.** With no env vars this runs in **SANDBOX_MODE** on a synthetic fixture (portal 99000001): zero network calls, nothing posted, no CRM updates. Slack / Teams payloads appear in **Dry-Run Preview**.\n\nGo-live needs explicit opt-ins:\n`SANDBOX_MODE=false` · `DRY_RUN=false` · `NOTIFICATIONS_ENABLED=true` (+ webhook URL in env, host allowlisted) · optional `HUBSPOT_MUTATIONS_ENABLED=true` (hygiene flags only).\n\nFail-closed: failed / truncated searches abort; bad-data ratio and missing quotas block posting. Secrets only via `$env`. See README.md.",
+        "height": 340,
+        "width": 560,
+        "color": 4
+      },
+      "id": "9f25b987-80cf-4240-a0d0-65e38aa34401",
+      "name": "Safety Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -480,
+        -460
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "1fb185af-3ae7-4a9f-a8fe-e6d940117484",
+      "name": "Manual Test Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hubspot-quota-variance",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "dfbfcd55-6976-4440-a50e-cfb67786ad55",
+      "name": "Forecast Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        120
+      ],
+      "webhookId": "2d0498af-076f-4eef-a9de-c1ebcdb04f49",
+      "notes": "POST {\"quarter_start\":\"YYYY-MM-DD\",\"as_of\":\"YYYY-MM-DD\"} (both optional) with header x-forecast-secret (required in live mode)."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "47 7 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "57d49451-b276-48e6-a446-b4930cac9903",
+      "name": "Weekly Schedule (Mon 07:47)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        300
+      ],
+      "notes": "Mondays 07:47 in the instance time zone. Ships inactive."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Config & Safety Gate\n// Env-only configuration, fail-safe flags, fiscal-quarter and as-of resolution,\n// webhook authentication, and notification-destination validation.\n//   * Safe-ON  (SANDBOX_MODE, DRY_RUN) turn OFF only on false/0/no/off.\n//   * Safe-OFF (NOTIFICATIONS_ENABLED, HUBSPOT_MUTATIONS_ENABLED, ...) turn ON\n//     only on true/1/yes/on. Typos keep the safe value. Blocked $env => safe.\n// Webhook URLs are secrets: only \"is set / host allowed\" booleans and the\n// host name leave this node; the URL itself is read again inside the HTTP node.\n// ============================================================================\nconst TRUTHY = ['true', '1', 'yes', 'on'];\nconst FALSY = ['false', '0', 'no', 'off'];\nlet envBlocked = false;\nfunction readEnv(key) {\n  try {\n    const v = $env[key];\n    return v === undefined || v === null ? '' : String(v).trim();\n  } catch (e) {\n    envBlocked = true;\n    return '';\n  }\n}\nconst str = (k, d = '') => readEnv(k) || d;\nconst safeOn = (k) => !FALSY.includes(readEnv(k).toLowerCase());\nconst safeOff = (k) => TRUTHY.includes(readEnv(k).toLowerCase());\nconst list = (k, d = '') => (readEnv(k) || d).split(',').map((s) => s.trim()).filter(Boolean);\nconst prop = (k, d) => (readEnv(k) || d).replace(/[^a-z0-9_]/gi, '');\nconst configErrors = [];\nconst warnings = [];\nconst DEC = /^\\d+(\\.\\d+)?$/;\nconst intIn = (k, d, min, max) => {\n  const raw = readEnv(k);\n  if (raw === '') return d;\n  const n = Number(raw);\n  if (!Number.isInteger(n) || n < min || n > max) { configErrors.push(`${k} must be an integer ${min}-${max} (got \"${raw}\")`); return d; }\n  return n;\n};\nconst decIn = (k, d, max) => {\n  const raw = readEnv(k).replace(/[,_\\s]/g, '');\n  if (raw === '') return d;\n  if (!DEC.test(raw) || (max !== undefined && Number(raw) > max)) { configErrors.push(`${k} must be a decimal${max !== undefined ? ' <= ' + max : ''} (got \"${readEnv(k)}\")`); return d; }\n  return raw;\n};\nconst DAY = 86400000;\nconst parseYmd = (s) => {\n  const m = String(s || '').match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!m) return null;\n  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));\n  return new Date(ms).toISOString().slice(0, 10) === m[0] ? ms : null; // rejects 2026-13-01, 2026-02-30\n};\n\nconst sandboxMode = safeOn('SANDBOX_MODE');\nconst dryRun = safeOn('DRY_RUN');\nconst notificationsEnabled = safeOff('NOTIFICATIONS_ENABLED');\nconst hubspotMutationsEnabled = safeOff('HUBSPOT_MUTATIONS_ENABLED');\nconst hasHubspotToken = readEnv('HUBSPOT_ACCESS_TOKEN') !== '';\nconst hasWebhookSecret = readEnv('WEBHOOK_SHARED_SECRET').length >= 16;\n\nconst SYNTHETIC_PORTAL_ID = '99000001';\nconst configuredPortalId = str('HUBSPOT_PORTAL_ID');\nif (!sandboxMode) {\n  const problems = [];\n  if (!hasHubspotToken) problems.push('HUBSPOT_ACCESS_TOKEN is not set');\n  if (!/^\\d{1,12}$/.test(configuredPortalId)) problems.push('HUBSPOT_PORTAL_ID must be a numeric HubSpot portal ID');\n  if (problems.length) throw new Error('Live mode (SANDBOX_MODE=false) refused: ' + problems.join('; ') + '. Fix the variables or keep SANDBOX_MODE=true.');\n}\n\n// ---- Trigger & webhook auth ---------------------------------------------------\nfunction constantTimeEqual(a, b) {\n  const x = String(a || ''), y = String(b || '');\n  const len = Math.max(x.length, y.length);\n  let diff = x.length ^ y.length;\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0 && x.length > 0;\n}\nconst raw = $input.first().json || {};\nconst isWebhook = raw && typeof raw === 'object' && 'body' in raw && 'headers' in raw;\nlet requested = {};\nif (isWebhook) {\n  const headers = Object.fromEntries(Object.entries(raw.headers || {}).map(([k, v]) => [String(k).toLowerCase(), v]));\n  const query = raw.query && typeof raw.query === 'object' ? raw.query : {};\n  const provided = headers['x-forecast-secret'] !== undefined ? headers['x-forecast-secret'] : query.forecast_secret;\n  if (!sandboxMode && !(hasWebhookSecret && constantTimeEqual(provided, readEnv('WEBHOOK_SHARED_SECRET')))) {\n    throw new Error('Webhook rejected: WEBHOOK_SHARED_SECRET (16+ chars) must be set and sent as header x-forecast-secret (or ?forecast_secret=).');\n  }\n  const b = raw.body && typeof raw.body === 'object' ? raw.body : {};\n  requested = { quarterStart: b.quarter_start ? String(b.quarter_start).trim() : '', asOf: b.as_of ? String(b.as_of).trim() : '' };\n}\n\n// ---- As-of date & fiscal quarter (UTC) -----------------------------------------\nconst nowMs = (() => {\n  const o = str('NOW_OVERRIDE');\n  return o && !Number.isNaN(Date.parse(o)) ? Date.parse(o) : Date.now();\n})();\nconst asOfRaw = requested.asOf || str('AS_OF_DATE');\nlet asOfMs = asOfRaw ? parseYmd(asOfRaw) : Math.floor(nowMs / DAY) * DAY;\nif (asOfMs === null) throw new Error(`Invalid as-of date \"${asOfRaw}\"; expected YYYY-MM-DD.`);\nif (asOfMs > Math.floor(nowMs / DAY) * DAY) throw new Error(`As-of date ${asOfRaw} is in the future.`);\n\nconst fyStartMonth = intIn('FISCAL_YEAR_START_MONTH', 1, 1, 12);\nconst qsRaw = requested.quarterStart || str('QUARTER_START_DATE');\nlet qStartMs;\nif (qsRaw) {\n  qStartMs = parseYmd(qsRaw);\n  if (qStartMs === null) throw new Error(`Invalid quarter start \"${qsRaw}\"; expected YYYY-MM-DD.`);\n  const d = new Date(qStartMs);\n  if (d.getUTCDate() !== 1 || (d.getUTCMonth() + 1 - fyStartMonth + 12) % 3 !== 0) {\n    throw new Error(`Quarter start ${qsRaw} is not the first day of a fiscal quarter (FISCAL_YEAR_START_MONTH=${fyStartMonth}).`);\n  }\n} else {\n  const a = new Date(asOfMs);\n  const monthsIntoFy = (a.getUTCMonth() + 1 - fyStartMonth + 12) % 12;\n  qStartMs = Date.UTC(a.getUTCFullYear(), a.getUTCMonth() - (monthsIntoFy % 3), 1);\n}\nconst qs = new Date(qStartMs);\nconst qEndMs = Date.UTC(qs.getUTCFullYear(), qs.getUTCMonth() + 3, 1);\nconst monthsIntoFy = (qs.getUTCMonth() + 1 - fyStartMonth + 12) % 12;\nconst quarterNumber = Math.floor(monthsIntoFy / 3) + 1;\nconst fyStartYear = qs.getUTCMonth() + 1 >= fyStartMonth ? qs.getUTCFullYear() : qs.getUTCFullYear() - 1;\nconst fyLabelYear = fyStartMonth === 1 ? fyStartYear : fyStartYear + 1; // FY named by the calendar year it ends in\nconst quarterId = fyStartMonth === 1 ? `${fyLabelYear}-Q${quarterNumber}` : `FY${fyLabelYear}-Q${quarterNumber}`;\nif (asOfMs < qStartMs) throw new Error(`As-of date is before the start of ${quarterId}.`);\nconst quarterClosed = asOfMs >= qEndMs;\nif (quarterClosed) warnings.push(`As-of date is after ${quarterId} ended: this is a final (closed-quarter) report.`);\n\n// ---- Notification destinations ------------------------------------------------\nconst channels = list('NOTIFY_CHANNELS', 'slack').map((c) => c.toLowerCase()).filter((c) => ['slack', 'teams'].includes(c));\nconst allowedSuffixes = list('NOTIFY_ALLOWED_HOST_SUFFIXES', 'hooks.slack.com,.logic.azure.com,.powerplatform.com,.powerautomate.com');\nfunction checkUrl(key) {\n  const v = readEnv(key);\n  if (!v) return { set: false, valid: false, host: null, reason: `${key} is not set` };\n  // Strict parse without relying on the URL global (not available in every sandbox).\n  const m = v.match(/^(https?):\\/\\/([a-z0-9.-]+)(?::(\\d{1,5}))?(\\/[^\\s]*)?$/i);\n  if (!m || /@/.test(v.split('/').slice(0, 3).join('/'))) return { set: true, valid: false, host: null, reason: `${key} is not a valid URL` };\n  const protocol = m[1].toLowerCase();\n  const host = m[2].toLowerCase();\n  const hostOk = allowedSuffixes.some((s) => (s.startsWith('.') ? host.endsWith(s) : host === s));\n  const httpsOk = protocol === 'https' || (protocol === 'http' && /^(127\\.0\\.0\\.1|localhost)$/.test(host) && allowedSuffixes.includes(host));\n  if (!httpsOk) return { set: true, valid: false, host, reason: `${key} must use https` };\n  if (!hostOk) return { set: true, valid: false, host, reason: `${key} host ${host} is not in NOTIFY_ALLOWED_HOST_SUFFIXES` };\n  return { set: true, valid: true, host, reason: null };\n}\nconst dest = { slack: checkUrl('SLACK_WEBHOOK_URL'), teams: checkUrl('TEAMS_WEBHOOK_URL') };\n\nconst notifyBlockers = [];\nif (sandboxMode) notifyBlockers.push('SANDBOX_MODE=true (synthetic fixture run)');\nif (dryRun) notifyBlockers.push('DRY_RUN=true');\nif (!notificationsEnabled) notifyBlockers.push('NOTIFICATIONS_ENABLED is not true');\nif (!channels.length) notifyBlockers.push('NOTIFY_CHANNELS lists no supported channel (slack, teams)');\nfor (const c of channels) if (!dest[c].valid) notifyBlockers.push(dest[c].reason);\nif (envBlocked) notifyBlockers.push('n8n blocked $env access');\n\nconst stampBlockers = [];\nif (sandboxMode) stampBlockers.push('SANDBOX_MODE=true');\nif (dryRun) stampBlockers.push('DRY_RUN=true');\nif (!hubspotMutationsEnabled) stampBlockers.push('HUBSPOT_MUTATIONS_ENABLED is not true');\nif (envBlocked) stampBlockers.push('n8n blocked $env access');\n\n// ---- Forecast policy ----------------------------------------------------------\nconst pacingBasis = str('PACING_BASIS', 'calendar').toLowerCase() === 'business' ? 'business' : 'calendar';\nconst holidays = [];\nfor (const h of list('BUSINESS_HOLIDAYS')) { const ms = parseYmd(h); if (ms === null) configErrors.push(`BUSINESS_HOLIDAYS entry \"${h}\" is not YYYY-MM-DD`); else holidays.push(ms); }\nconst probabilitySource = str('PROBABILITY_SOURCE', 'hubspot').toLowerCase() === 'stage_map' ? 'stage_map' : 'hubspot';\nconst stageWeights = {};\nfor (const pair of list('STAGE_WEIGHTS')) {\n  const m = pair.match(/^([A-Za-z0-9_-]{1,64}):(\\d+(?:\\.\\d+)?)$/);\n  if (!m || Number(m[2]) > 1) { configErrors.push(`STAGE_WEIGHTS entry \"${pair}\" must be stageId:0..1`); continue; }\n  stageWeights[m[1]] = m[2];\n}\nif (probabilitySource === 'stage_map' && !Object.keys(stageWeights).length) configErrors.push('PROBABILITY_SOURCE=stage_map requires STAGE_WEIGHTS');\nconst thresholds = {\n  ahead: decIn('PACING_AHEAD_THRESHOLD', '1.10'),\n  onTrack: decIn('PACING_ON_TRACK_THRESHOLD', '0.90'),\n  atRisk: decIn('PACING_AT_RISK_THRESHOLD', '0.70'),\n  criticalProjection: decIn('CRITICAL_PROJECTED_ATTAINMENT', '0.75'),\n  minElapsed: decIn('MIN_ELAPSED_FRACTION_FOR_PACING', '0.10', 1),\n  minCoverage: decIn('MIN_PIPELINE_COVERAGE', '1.0'),\n};\nif (!(Number(thresholds.ahead) >= Number(thresholds.onTrack) && Number(thresholds.onTrack) >= Number(thresholds.atRisk))) {\n  configErrors.push('Thresholds must satisfy AHEAD >= ON_TRACK >= AT_RISK');\n}\nconst quotaSource = str('QUOTA_SOURCE', 'hubspot_goals').toLowerCase() === 'env' ? 'env' : 'hubspot_goals';\nconst quotaMap = {};\nfor (const pair of list('QUOTA_MAP')) {\n  const m = pair.match(/^(\\d{1,20}):(\\d+(?:\\.\\d+)?)$/);\n  if (!m) { configErrors.push(`QUOTA_MAP entry \"${pair.slice(0, 40)}\" must be ownerId:amount`); continue; }\n  quotaMap[m[1]] = m[2];\n}\nif (quotaSource === 'env' && !sandboxMode && !Object.keys(quotaMap).length) configErrors.push('QUOTA_SOURCE=env requires QUOTA_MAP');\nconst ownerIdList = (k) => list(k).filter((x) => /^\\d{1,20}$/.test(x));\n\nconst props = {\n  amount: prop('AMOUNT_PROPERTY', 'amount_in_home_currency'),\n  hygieneFlag: prop('HYGIENE_FLAG_PROPERTY', 'forecast_hygiene_flag'),\n  hygieneCheckedAt: prop('HYGIENE_CHECKED_AT_PROPERTY', 'forecast_hygiene_checked_at'),\n};\nconst config = {\n  runId: 'qv-' + new Date(nowMs).toISOString().replace(/[-:.TZ]/g, '').slice(0, 14) + '-' + Math.random().toString(36).slice(2, 8),\n  now: new Date(nowMs).toISOString(),\n  envBlocked,\n  sandboxMode,\n  dryRun,\n  portalId: sandboxMode ? SYNTHETIC_PORTAL_ID : configuredPortalId,\n  trigger: isWebhook ? 'webhook' : 'manual-or-schedule',\n  quarter: { id: quarterId, number: quarterNumber, fiscalYear: fyLabelYear, fyStartMonth, startMs: qStartMs, endMs: qEndMs, startIso: new Date(qStartMs).toISOString().slice(0, 10), endIsoExclusive: new Date(qEndMs).toISOString().slice(0, 10), closed: quarterClosed },\n  asOf: { ms: asOfMs, iso: new Date(asOfMs).toISOString().slice(0, 10), source: requested.asOf ? 'webhook' : asOfRaw ? 'env' : 'today' },\n  currency: { home: str('HOME_CURRENCY', 'USD').toUpperCase() },\n  quota: { source: quotaSource, map: quotaMap, goalNameContains: str('GOAL_NAME_CONTAINS', 'quota').toLowerCase() },\n  pipeline: {\n    probabilitySource,\n    stageWeights,\n    weightPastDue: safeOff('WEIGHT_PAST_DUE_PIPELINE'),\n    pipelines: list('PIPELINES').filter((p) => /^[A-Za-z0-9_-]{1,64}$/.test(p)),\n  },\n  pacing: { basis: pacingBasis, holidays, thresholds },\n  scope: { includeOwnerIds: ownerIdList('INCLUDED_OWNER_IDS'), excludeOwnerIds: ownerIdList('EXCLUDED_OWNER_IDS') },\n  guards: { maxInvalidRecordPct: decIn('MAX_INVALID_RECORD_PCT', '10', 100) },\n  display: { repLabel: str('REP_LABEL', 'name').toLowerCase() === 'id' ? 'id' : 'name', maxReps: intIn('MAX_REPS_IN_MESSAGE', 25, 1, 40), title: str('REPORT_TITLE', 'Quota vs Actuals: Weekly Pacing').slice(0, 80) },\n  hubspot: {\n    apiBase: str('HUBSPOT_API_BASE_URL', 'https://api.hubapi.com').replace(/\\/+$/, ''),\n    appBase: str('HUBSPOT_APP_BASE_URL', 'https://app.hubspot.com').replace(/\\/+$/, ''),\n    props,\n    pageSize: intIn('HUBSPOT_SEARCH_PAGE_SIZE', 200, 10, 200),\n    maxSearchPages: 50,\n    mutationsEnabled: hubspotMutationsEnabled,\n    stampAllowed: stampBlockers.length === 0,\n    stampBlockers,\n  },\n  notify: {\n    enabled: notificationsEnabled,\n    channels,\n    destinations: { slack: { set: dest.slack.set, valid: dest.slack.valid, host: dest.slack.host }, teams: { set: dest.teams.set, valid: dest.teams.valid, host: dest.teams.host } },\n    allowedByConfig: notifyBlockers.length === 0 && configErrors.length === 0,\n    blockers: [...notifyBlockers, ...(configErrors.length ? [`${configErrors.length} configuration error(s)`] : [])],\n    forceRepost: safeOff('FORCE_REPOST'),\n  },\n  configErrors,\n  warnings,\n};\nconst safetyDecisions = [\n  `Mode: ${sandboxMode ? 'SANDBOX (synthetic fixture, zero network calls)' : 'LIVE (read-only HubSpot searches)'}`,\n  `Quarter: ${quarterId} (${config.quarter.startIso} to ${config.quarter.endIsoExclusive}, exclusive) as of ${config.asOf.iso}`,\n  `Quota source: ${quotaSource}; probability: ${probabilitySource}; pacing: ${pacingBasis} days`,\n  `Notifications: ${config.notify.allowedByConfig ? 'ARMED (' + channels.join(', ') + ')' : 'BLOCKED'}`,\n  `HubSpot hygiene stamp: ${config.hubspot.stampAllowed ? 'ARMED' : 'BLOCKED'}`,\n];\nreturn [{ json: { config, safetyDecisions } }];\n"
+      },
+      "id": "dff0eac6-7b53-4c1b-a558-6ff5256863dc",
+      "name": "Config & Safety Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -220,
+        120
+      ],
+      "notes": "Env-only config, fail-safe flags, fiscal quarter + as-of, webhook auth, notification host allowlist."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "305b728a-c1ad-45cc-ada7-9bb46f173fba",
+              "leftValue": "={{ $('Config & Safety Gate').first().json.config.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c5166091-cfa9-4913-a801-a1e382021aa6",
+      "name": "Sandbox Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        20,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Load Synthetic Quota Fixture  (SANDBOX_MODE=true path - ZERO network calls)\n// Embedded object = sample-payloads/quota-variance-fixture.json (verified by\n// the simulator).\n// ============================================================================\nconst FIXTURE = {\n  \"_meta\": {\n    \"synthetic\": true,\n    \"fixtureVersion\": \"1.0.0\",\n    \"description\": \"Fully synthetic HubSpot owners, goal_targets (quotas) and deals for offline quota-vs-actuals testing. Every name, ID, email (example.com) and amount is fictional. Shapes mirror HubSpot CRM v3 search results and the owners API.\",\n    \"placeholderPortalId\": \"99000001\",\n    \"quarter\": \"2026-Q4 (2026-10-01 to 2026-12-31, 92 days)\",\n    \"asOf\": \"2026-11-16 (46 days elapsed = exactly 50%)\",\n    \"expectedWithDefaults\": {\n      \"99100001\": \"AHEAD: 210k won vs 150k expected (monthly goals summed 3 x 100k)\",\n      \"99100002\": \"ON_TRACK: 120k vs 120k expected; one closed-won deal has an invalid amount\",\n      \"99100003\": \"AT_RISK: 80k vs 100k expected; one past-due open deal excluded from weighting\",\n      \"99100004\": \"CRITICAL + ZERO_PIPELINE: 30k vs 90k expected, no open pipeline\",\n      \"99100005\": \"QUOTA_MET: 160k won vs 150k quota\",\n      \"99100006\": \"NO_QUOTA: has closed-won revenue but no quota goal\",\n      \"99100007\": \"CRITICAL by projection: annual goal prorated 92/365; pacing 0.83 but projected attainment 41%\",\n      \"unassigned\": \"5k closed-won with no owner: counted in team actuals and flagged\"\n    }\n  },\n  \"portalId\": \"99000001\",\n  \"owners\": [\n    {\n      \"id\": \"99100001\",\n      \"firstName\": \"Avery\",\n      \"lastName\": \"Rep (Mock)\",\n      \"email\": \"avery.rep@example.com\"\n    },\n    {\n      \"id\": \"99100002\",\n      \"firstName\": \"Jordan\",\n      \"lastName\": \"Rep (Mock)\",\n      \"email\": \"jordan.rep@example.com\"\n    },\n    {\n      \"id\": \"99100003\",\n      \"firstName\": \"Riley\",\n      \"lastName\": \"Rep (Mock)\",\n      \"email\": \"riley.rep@example.com\"\n    },\n    {\n      \"id\": \"99100004\",\n      \"firstName\": \"Morgan\",\n      \"lastName\": \"Rep (Mock)\",\n      \"email\": \"morgan.rep@example.com\"\n    },\n    {\n      \"id\": \"99100005\",\n      \"firstName\": \"Casey\",\n      \"lastName\": \"Rep (Mock)\",\n      \"email\": \"casey.rep@example.com\"\n    },\n    {\n      \"id\": \"99100006\",\n      \"firstName\": \"Taylor\",\n      \"lastName\": \"Rep (Mock)\",\n      \"email\": \"taylor.rep@example.com\"\n    },\n    {\n      \"id\": \"99100007\",\n      \"firstName\": \"Quinn\",\n      \"lastName\": \"Rep (Mock)\",\n      \"email\": \"quinn.rep@example.com\"\n    }\n  ],\n  \"goalTargets\": [\n    {\n      \"id\": \"990030001\",\n      \"properties\": {\n        \"hs_goal_name\": \"FY2026 Sales Quota (Mock)\",\n        \"hs_milestone\": \"monthly\",\n        \"hs_target_amount\": \"100000\",\n        \"hs_start_datetime\": \"2026-10-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-10-31T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100001\"\n      }\n    },\n    {\n      \"id\": \"990030002\",\n      \"properties\": {\n        \"hs_goal_name\": \"FY2026 Sales Quota (Mock)\",\n        \"hs_milestone\": \"monthly\",\n        \"hs_target_amount\": \"100000\",\n        \"hs_start_datetime\": \"2026-11-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-11-30T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100001\"\n      }\n    },\n    {\n      \"id\": \"990030003\",\n      \"properties\": {\n        \"hs_goal_name\": \"FY2026 Sales Quota (Mock)\",\n        \"hs_milestone\": \"monthly\",\n        \"hs_target_amount\": \"100000\",\n        \"hs_start_datetime\": \"2026-12-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-12-31T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100001\"\n      }\n    },\n    {\n      \"id\": \"990030004\",\n      \"properties\": {\n        \"hs_goal_name\": \"FY2026 Sales Quota (Mock)\",\n        \"hs_milestone\": \"monthly\",\n        \"hs_target_amount\": \"95000\",\n        \"hs_start_datetime\": \"2026-09-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-09-30T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100001\"\n      }\n    },\n    {\n      \"id\": \"990030005\",\n      \"properties\": {\n        \"hs_goal_name\": \"Calls Made (Mock)\",\n        \"hs_milestone\": \"quarterly\",\n        \"hs_target_amount\": \"500\",\n        \"hs_start_datetime\": \"2026-10-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-12-31T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100001\"\n      }\n    },\n    {\n      \"id\": \"990030006\",\n      \"properties\": {\n        \"hs_goal_name\": \"Q4 New Business Quota (Mock)\",\n        \"hs_milestone\": \"quarterly\",\n        \"hs_target_amount\": \"240000\",\n        \"hs_start_datetime\": \"2026-10-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-12-31T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100002\"\n      }\n    },\n    {\n      \"id\": \"990030007\",\n      \"properties\": {\n        \"hs_goal_name\": \"Q4 New Business Quota (Mock)\",\n        \"hs_milestone\": \"quarterly\",\n        \"hs_target_amount\": \"200000\",\n        \"hs_start_datetime\": \"2026-10-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-12-31T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100003\"\n      }\n    },\n    {\n      \"id\": \"990030008\",\n      \"properties\": {\n        \"hs_goal_name\": \"Q4 New Business Quota (Mock)\",\n        \"hs_milestone\": \"quarterly\",\n        \"hs_target_amount\": \"180000\",\n        \"hs_start_datetime\": \"2026-10-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-12-31T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100004\"\n      }\n    },\n    {\n      \"id\": \"990030009\",\n      \"properties\": {\n        \"hs_goal_name\": \"Q4 New Business Quota (Mock)\",\n        \"hs_milestone\": \"quarterly\",\n        \"hs_target_amount\": \"150000\",\n        \"hs_start_datetime\": \"2026-10-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-12-31T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100005\"\n      }\n    },\n    {\n      \"id\": \"990030010\",\n      \"properties\": {\n        \"hs_goal_name\": \"2026 Annual Revenue Quota (Mock)\",\n        \"hs_milestone\": \"annually\",\n        \"hs_target_amount\": \"480000\",\n        \"hs_start_datetime\": \"2026-01-01T00:00:00.000Z\",\n        \"hs_end_datetime\": \"2026-12-31T23:59:59.999Z\",\n        \"hubspot_owner_id\": \"99100007\"\n      }\n    }\n  ],\n  \"closedWonDeals\": [\n    {\n      \"id\": \"990040001\",\n      \"properties\": {\n        \"dealname\": \"Acme Enterprise Corp - Expansion (Mock)\",\n        \"amount\": \"120000\",\n        \"amount_in_home_currency\": \"120000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-10-14T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040002\",\n      \"properties\": {\n        \"dealname\": \"Northstar Logistics - Fleet (Mock)\",\n        \"amount\": \"90000\",\n        \"amount_in_home_currency\": \"90000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-11-05T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040003\",\n      \"properties\": {\n        \"dealname\": \"Bluebird Analytics - Pro (Mock)\",\n        \"amount\": \"120000\",\n        \"amount_in_home_currency\": \"120000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-10-30T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040004\",\n      \"properties\": {\n        \"dealname\": \"Pinecrest Media - Growth (Mock)\",\n        \"amount\": \"50000\",\n        \"amount_in_home_currency\": \"50000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-10-08T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100003\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040005\",\n      \"properties\": {\n        \"dealname\": \"Harborview Freight - Starter (Mock)\",\n        \"amount\": \"30000\",\n        \"amount_in_home_currency\": \"30000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-11-12T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100003\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040006\",\n      \"properties\": {\n        \"dealname\": \"Granite Robotics - Pilot (Mock)\",\n        \"amount\": \"30000\",\n        \"amount_in_home_currency\": \"30000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-10-21T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100004\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040007\",\n      \"properties\": {\n        \"dealname\": \"Lakeside Health - Platform (Mock)\",\n        \"amount\": \"100000\",\n        \"amount_in_home_currency\": \"100000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-10-02T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100005\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040008\",\n      \"properties\": {\n        \"dealname\": \"Meridian Retail - Suite (Mock)\",\n        \"amount\": \"60000\",\n        \"amount_in_home_currency\": \"60000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-11-10T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100005\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040009\",\n      \"properties\": {\n        \"dealname\": \"Orbit Labs - Add-on (Mock)\",\n        \"amount\": \"20000\",\n        \"amount_in_home_currency\": \"20000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-11-03T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100006\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040010\",\n      \"properties\": {\n        \"dealname\": \"Zurich Cafe Systems AG - POS (Mock)\",\n        \"amount\": \"46000\",\n        \"amount_in_home_currency\": \"50000\",\n        \"deal_currency_code\": \"EUR\",\n        \"closedate\": \"2026-10-19T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100007\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040011\",\n      \"properties\": {\n        \"dealname\": \"Cobalt Systems - Unassigned (Mock)\",\n        \"amount\": \"5000\",\n        \"amount_in_home_currency\": \"5000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-10-25T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040012\",\n      \"properties\": {\n        \"dealname\": \"Ember Foods - Bad Amount (Mock)\",\n        \"amount\": \"N/A\",\n        \"amount_in_home_currency\": \"N/A\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-11-09T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    },\n    {\n      \"id\": \"990040013\",\n      \"properties\": {\n        \"dealname\": \"Quartz Mobility - Prior Quarter (Mock)\",\n        \"amount\": \"70000\",\n        \"amount_in_home_currency\": \"70000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-09-28T16:00:00.000Z\",\n        \"dealstage\": \"closedwon\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"hs_is_closed_won\": \"true\",\n        \"hs_is_closed\": \"true\"\n      }\n    }\n  ],\n  \"openDeals\": [\n    {\n      \"id\": \"990050001\",\n      \"properties\": {\n        \"dealname\": \"Velvet Peak Apparel - Platform (Mock)\",\n        \"amount\": \"80000\",\n        \"amount_in_home_currency\": \"80000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-12-10T17:00:00.000Z\",\n        \"dealstage\": \"presentationscheduled\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100001\",\n        \"hs_deal_stage_probability\": \"0.6\",\n        \"hs_is_closed_won\": \"false\",\n        \"hs_is_closed\": \"false\"\n      }\n    },\n    {\n      \"id\": \"990050002\",\n      \"properties\": {\n        \"dealname\": \"Sakura Logistics KK - Enterprise (Mock)\",\n        \"amount\": \"150000\",\n        \"amount_in_home_currency\": \"150000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-12-15T17:00:00.000Z\",\n        \"dealstage\": \"qualifiedtobuy\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"hs_deal_stage_probability\": \"0.4\",\n        \"hs_is_closed_won\": \"false\",\n        \"hs_is_closed\": \"false\"\n      }\n    },\n    {\n      \"id\": \"990050003\",\n      \"properties\": {\n        \"dealname\": \"Alpine Ledger SA - Core (Mock)\",\n        \"amount\": \"60000\",\n        \"amount_in_home_currency\": \"60000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-11-28T17:00:00.000Z\",\n        \"dealstage\": \"decisionmakerboughtin\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100002\",\n        \"hs_deal_stage_probability\": \"0.8\",\n        \"hs_is_closed_won\": \"false\",\n        \"hs_is_closed\": \"false\"\n      }\n    },\n    {\n      \"id\": \"990050004\",\n      \"properties\": {\n        \"dealname\": \"Ironwood Energy - Rollout (Mock)\",\n        \"amount\": \"200000\",\n        \"amount_in_home_currency\": \"200000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-12-20T17:00:00.000Z\",\n        \"dealstage\": \"99300001\",\n        \"pipeline\": \"99200001\",\n        \"hubspot_owner_id\": \"99100003\",\n        \"hs_deal_stage_probability\": \"0.5\",\n        \"hs_is_closed_won\": \"false\",\n        \"hs_is_closed\": \"false\"\n      }\n    },\n    {\n      \"id\": \"990050005\",\n      \"properties\": {\n        \"dealname\": \"Copperline Telecom - Past Due (Mock)\",\n        \"amount\": \"40000\",\n        \"amount_in_home_currency\": \"40000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-11-01T17:00:00.000Z\",\n        \"dealstage\": \"contractsent\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100003\",\n        \"hs_deal_stage_probability\": \"0.9\",\n        \"hs_is_closed_won\": \"false\",\n        \"hs_is_closed\": \"false\"\n      }\n    },\n    {\n      \"id\": \"990050006\",\n      \"properties\": {\n        \"dealname\": \"Silverbrook Dental - Starter (Mock)\",\n        \"amount\": \"50000\",\n        \"amount_in_home_currency\": \"50000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-12-05T17:00:00.000Z\",\n        \"dealstage\": \"appointmentscheduled\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100005\",\n        \"hs_deal_stage_probability\": \"0.2\",\n        \"hs_is_closed_won\": \"false\",\n        \"hs_is_closed\": \"false\"\n      }\n    },\n    {\n      \"id\": \"990050007\",\n      \"properties\": {\n        \"dealname\": \"Tidewater Marine - No Probability (Mock)\",\n        \"amount\": \"70000\",\n        \"amount_in_home_currency\": \"70000\",\n        \"deal_currency_code\": \"USD\",\n        \"closedate\": \"2026-12-18T17:00:00.000Z\",\n        \"dealstage\": \"qualifiedtobuy\",\n        \"pipeline\": \"default\",\n        \"hubspot_owner_id\": \"99100007\",\n        \"hs_deal_stage_probability\": \"\",\n        \"hs_is_closed_won\": \"false\",\n        \"hs_is_closed\": \"false\"\n      }\n    }\n  ],\n  \"previousSnapshot\": {\n    \"quarterId\": \"2026-Q4\",\n    \"asOf\": \"2026-11-09\",\n    \"reps\": {\n      \"99100001\": {\n        \"wonMinor\": 12000000,\n        \"weightedMinor\": 9000000\n      },\n      \"99100002\": {\n        \"wonMinor\": 12000000,\n        \"weightedMinor\": 6000000\n      },\n      \"99100003\": {\n        \"wonMinor\": 5000000,\n        \"weightedMinor\": 12000000\n      },\n      \"99100004\": {\n        \"wonMinor\": 3000000,\n        \"weightedMinor\": 0\n      },\n      \"99100005\": {\n        \"wonMinor\": 10000000,\n        \"weightedMinor\": 2000000\n      },\n      \"99100006\": {\n        \"wonMinor\": 0,\n        \"weightedMinor\": 0\n      },\n      \"99100007\": {\n        \"wonMinor\": 5000000,\n        \"weightedMinor\": 0\n      }\n    },\n    \"team\": {\n      \"wonMinor\": 47500000,\n      \"weightedMinor\": 29000000\n    }\n  }\n};\n\nreturn [{\n  json: {\n    source: 'synthetic-fixture',\n    complete: true,\n    owners: FIXTURE.owners,\n    ownersLookup: 'ok',\n    goalTargets: FIXTURE.goalTargets,\n    closedWonDeals: FIXTURE.closedWonDeals,\n    openDeals: FIXTURE.openDeals,\n    previousSnapshot: FIXTURE.previousSnapshot,\n    collectionWarnings: [],\n  },\n}];\n"
+      },
+      "id": "4cbc1c10-455b-408e-a5fa-b9bcba3e136b",
+      "name": "Load Synthetic Quota Fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "94511265-f865-4fd8-ae42-c2bcea2d0181",
+              "leftValue": "={{ $('Config & Safety Gate').first().json.config.quota.source === 'hubspot_goals' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "db5e5ae6-cc1f-4c16-a10d-19d22d1e67cf",
+      "name": "Quotas From HubSpot Goals?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Build Goal Search  (LIVE path, QUOTA_SOURCE=hubspot_goals)\n// Read-only search of goal_targets overlapping the quarter. Name / owner\n// filtering and proration happen in the calculator.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst q = config.quarter;\nreturn [{ json: {\n  url: `${config.hubspot.apiBase}/crm/v3/objects/goal_targets/search`,\n  body: {\n    filterGroups: [{ filters: [\n      { propertyName: 'hs_start_datetime', operator: 'LT', value: String(q.endMs) },\n      { propertyName: 'hs_end_datetime', operator: 'GT', value: String(q.startMs) },\n    ] }],\n    properties: ['hs_goal_name', 'hs_target_amount', 'hs_start_datetime', 'hs_end_datetime', 'hubspot_owner_id', 'hs_milestone'],\n    sorts: [{ propertyName: 'hs_object_id', direction: 'ASCENDING' }],\n    limit: config.hubspot.pageSize,\n  },\n} }];\n"
+      },
+      "id": "4a625103-7ee1-4379-a1b7-95a4809e1988",
+      "name": "Build Goal Search",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "body",
+                    "name": "after",
+                    "value": "={{ $response.body.paging && $response.body.paging.next ? $response.body.paging.next.after : undefined }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next || !$response.body.paging.next.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 50,
+              "requestInterval": 300
+            }
+          }
+        }
+      },
+      "id": "33ca1e78-df8e-4411-a815-e8ffd5773ac1",
+      "name": "HubSpot: Search Goal Targets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        200
+      ],
+      "notes": "Read-only goal_targets search overlapping the quarter. Stops the run on failure.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Collect Goals  (LIVE path) - FAIL CLOSED\n// Validates the goal_targets pages (or uses QUOTA_MAP when QUOTA_SOURCE=env)\n// and builds the closed-won deal search for the quarter.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\n// ---- Fail-closed page validation (shared logic, inlined per node) ----------\nfunction collectPages(label, maxPages) {\n  const pages = $input.all().map((i) => i.json);\n  const failed = pages.find((p) => p && p.error);\n  if (failed) throw new Error(`HubSpot ${label} search failed; aborting (no partial forecast): ` + String(failed.error.message || failed.error).slice(0, 300));\n  const total = pages.length && typeof pages[0].total === 'number' ? pages[0].total : null;\n  if (total !== null && total >= 10000) throw new Error(`HubSpot ${label} search matched ${total} records; the search API cannot page past 10,000. Narrow PIPELINES or the scope.`);\n  const last = pages[pages.length - 1] || {};\n  if (pages.length >= maxPages && last.paging && last.paging.next) throw new Error(`HubSpot ${label} pagination stopped at ${pages.length} pages with more results pending; aborting.`);\n  const seen = new Map();\n  for (const p of pages) for (const r of p.results || []) if (r && r.id && !seen.has(String(r.id))) seen.set(String(r.id), r);\n  return [...seen.values()];\n}\nconst DEAL_PROPERTIES = [...new Set(['dealname', 'amount', 'amount_in_home_currency', 'deal_currency_code', 'closedate', 'dealstage', 'pipeline', 'hubspot_owner_id', 'hs_deal_stage_probability', 'hs_is_closed_won', 'hs_is_closed', config.hubspot.props.amount, config.hubspot.props.hygieneFlag].filter(Boolean))];\nconst dealSearch = (firstFilter) => {\n  const filters = [firstFilter,\n    { propertyName: 'closedate', operator: 'GTE', value: String(config.quarter.startMs) },\n    { propertyName: 'closedate', operator: 'LT', value: String(config.quarter.endMs) }];\n  if (config.pipeline.pipelines.length) filters.push({ propertyName: 'pipeline', operator: 'IN', values: config.pipeline.pipelines });\n  return { filterGroups: [{ filters }], properties: DEAL_PROPERTIES, sorts: [{ propertyName: 'hs_object_id', direction: 'ASCENDING' }], limit: config.hubspot.pageSize };\n};\nconst goals = config.quota.source === 'hubspot_goals' ? collectPages('goal_targets', config.hubspot.maxSearchPages) : [];\nreturn [{ json: {\n  goals,\n  url: `${config.hubspot.apiBase}/crm/v3/objects/deals/search`,\n  body: dealSearch({ propertyName: 'hs_is_closed_won', operator: 'EQ', value: 'true' }),\n} }];\n"
+      },
+      "id": "acd6a27b-f718-41dd-ad5e-44598ed2c3e7",
+      "name": "Collect Goals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        300
+      ],
+      "notes": "Fail closed; builds the closed-won search."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "body",
+                    "name": "after",
+                    "value": "={{ $response.body.paging && $response.body.paging.next ? $response.body.paging.next.after : undefined }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next || !$response.body.paging.next.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 50,
+              "requestInterval": 300
+            }
+          }
+        }
+      },
+      "id": "e8531bf9-3157-469b-a083-2d19b9ecbe5a",
+      "name": "HubSpot: Search Closed-Won Deals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1140,
+        300
+      ],
+      "notes": "hs_is_closed_won = true, closedate in quarter.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Collect Closed-Won Deals  (LIVE path) - FAIL CLOSED\n// Builds the open-pipeline search (open deals closing inside the quarter).\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\n// ---- Fail-closed page validation (shared logic, inlined per node) ----------\nfunction collectPages(label, maxPages) {\n  const pages = $input.all().map((i) => i.json);\n  const failed = pages.find((p) => p && p.error);\n  if (failed) throw new Error(`HubSpot ${label} search failed; aborting (no partial forecast): ` + String(failed.error.message || failed.error).slice(0, 300));\n  const total = pages.length && typeof pages[0].total === 'number' ? pages[0].total : null;\n  if (total !== null && total >= 10000) throw new Error(`HubSpot ${label} search matched ${total} records; the search API cannot page past 10,000. Narrow PIPELINES or the scope.`);\n  const last = pages[pages.length - 1] || {};\n  if (pages.length >= maxPages && last.paging && last.paging.next) throw new Error(`HubSpot ${label} pagination stopped at ${pages.length} pages with more results pending; aborting.`);\n  const seen = new Map();\n  for (const p of pages) for (const r of p.results || []) if (r && r.id && !seen.has(String(r.id))) seen.set(String(r.id), r);\n  return [...seen.values()];\n}\nconst DEAL_PROPERTIES = [...new Set(['dealname', 'amount', 'amount_in_home_currency', 'deal_currency_code', 'closedate', 'dealstage', 'pipeline', 'hubspot_owner_id', 'hs_deal_stage_probability', 'hs_is_closed_won', 'hs_is_closed', config.hubspot.props.amount, config.hubspot.props.hygieneFlag].filter(Boolean))];\nconst dealSearch = (firstFilter) => {\n  const filters = [firstFilter,\n    { propertyName: 'closedate', operator: 'GTE', value: String(config.quarter.startMs) },\n    { propertyName: 'closedate', operator: 'LT', value: String(config.quarter.endMs) }];\n  if (config.pipeline.pipelines.length) filters.push({ propertyName: 'pipeline', operator: 'IN', values: config.pipeline.pipelines });\n  return { filterGroups: [{ filters }], properties: DEAL_PROPERTIES, sorts: [{ propertyName: 'hs_object_id', direction: 'ASCENDING' }], limit: config.hubspot.pageSize };\n};\nconst wonDeals = collectPages('closed-won deal', config.hubspot.maxSearchPages);\nreturn [{ json: {\n  wonDeals,\n  url: `${config.hubspot.apiBase}/crm/v3/objects/deals/search`,\n  body: dealSearch({ propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' }),\n} }];\n"
+      },
+      "id": "c28c5ec7-540d-4a60-a1c2-7ec686e38a8a",
+      "name": "Collect Closed-Won Deals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        300
+      ],
+      "notes": "Fail closed; builds the open-pipeline search."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "body",
+                    "name": "after",
+                    "value": "={{ $response.body.paging && $response.body.paging.next ? $response.body.paging.next.after : undefined }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next || !$response.body.paging.next.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 50,
+              "requestInterval": 300
+            }
+          }
+        }
+      },
+      "id": "8672422d-cf4d-4412-aaa9-15ccec10adc4",
+      "name": "HubSpot: Search Open Pipeline",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1580,
+        300
+      ],
+      "notes": "hs_is_closed = false, closedate in quarter.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Collect Open Pipeline  (LIVE path) - FAIL CLOSED\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\n// ---- Fail-closed page validation (shared logic, inlined per node) ----------\nfunction collectPages(label, maxPages) {\n  const pages = $input.all().map((i) => i.json);\n  const failed = pages.find((p) => p && p.error);\n  if (failed) throw new Error(`HubSpot ${label} search failed; aborting (no partial forecast): ` + String(failed.error.message || failed.error).slice(0, 300));\n  const total = pages.length && typeof pages[0].total === 'number' ? pages[0].total : null;\n  if (total !== null && total >= 10000) throw new Error(`HubSpot ${label} search matched ${total} records; the search API cannot page past 10,000. Narrow PIPELINES or the scope.`);\n  const last = pages[pages.length - 1] || {};\n  if (pages.length >= maxPages && last.paging && last.paging.next) throw new Error(`HubSpot ${label} pagination stopped at ${pages.length} pages with more results pending; aborting.`);\n  const seen = new Map();\n  for (const p of pages) for (const r of p.results || []) if (r && r.id && !seen.has(String(r.id))) seen.set(String(r.id), r);\n  return [...seen.values()];\n}\nconst openDeals = collectPages('open-pipeline deal', config.hubspot.maxSearchPages);\nreturn [{ json: { openDeals, ownersUrl: `${config.hubspot.apiBase}/crm/v3/owners?limit=100&archived=false` } }];\n"
+      },
+      "id": "52a2031a-7da9-499a-ad29-858fa373788c",
+      "name": "Collect Open Pipeline",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.ownersUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "after",
+                    "value": "={{ $response.body.paging && $response.body.paging.next ? $response.body.paging.next.after : undefined }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging || !$response.body.paging.next || !$response.body.paging.next.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 50,
+              "requestInterval": 300
+            }
+          }
+        }
+      },
+      "id": "e2a76461-3125-4183-a0a1-52b784506391",
+      "name": "HubSpot: Fetch Owners",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2020,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Optional: rep display names. Failure falls back to owner IDs."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Normalize Forecast Inputs\n// Unifies the sandbox fixture and the live searches into one shape. Owner\n// names are optional (labels fall back to owner IDs). The previous weekly\n// snapshot comes from the fixture (sandbox) or workflow static data (live).\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst first = $input.first().json || {};\nif (first.source === 'synthetic-fixture') {\n  return [{ json: { ...first } }];\n}\nconst warnings = [];\nconst goals = $('Collect Goals').first().json.goals;\nconst wonDeals = $('Collect Closed-Won Deals').first().json.wonDeals;\nconst openDeals = $('Collect Open Pipeline').first().json.openDeals;\nconst ownerPages = $input.all().map((i) => i.json);\nlet owners = [];\nlet ownersLookup = 'ok';\nif (ownerPages.some((p) => p.error)) {\n  ownersLookup = 'failed';\n  warnings.push('Owners could not be read (needs crm.objects.owners.read); reps are labelled by owner ID.');\n} else {\n  for (const p of ownerPages) for (const o of p.results || []) owners.push({ id: String(o.id), firstName: o.firstName || '', lastName: o.lastName || '' });\n}\nlet previousSnapshot = null;\ntry {\n  const sd = $getWorkflowStaticData('global');\n  previousSnapshot = (sd.snapshots && sd.snapshots[config.quarter.id]) || null;\n} catch (e) { previousSnapshot = null; }\nreturn [{ json: { source: 'hubspot-api', complete: true, owners, ownersLookup, goalTargets: goals, closedWonDeals: wonDeals, openDeals, previousSnapshot, collectionWarnings: warnings } }];\n"
+      },
+      "id": "c979f656-f891-4d75-aa9f-63914e760cf6",
+      "name": "Normalize Forecast Inputs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Variance Calculator  (pure computation, no network)\n// Per rep, for the fiscal quarter as of the as-of date:\n//   quota (goal_targets summed / prorated, or QUOTA_MAP)  -> Q\n//   closed-won ARR in the quarter                         -> W\n//   elapsed fraction (calendar or business days)          -> e\n//   expected-to-date = Q x e ; pacing variance = W - Q x e ; pacing ratio = W / (Q x e)\n//   gap-to-quota = max(0, Q - W)\n//   weighted pipeline = sum(amount x probability) of open deals closing in the\n//                       rest of the quarter (past-due deals excluded by default)\n//   forecast = W + weighted ; projected attainment = forecast / Q\n//   coverage = weighted / gap ; required weekly run rate = gap / weeks remaining\n// Money is BigInt minor units; ratios are compared as exact fractions.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst input = $input.first().json;\nconst DAY = 86400000;\nconst home = config.currency.home;\nconst T = config.pacing.thresholds;\n\n// ---------------------------------------------------------------- helpers\nconst ZERO_DP = new Set(['JPY', 'KRW', 'CLP', 'VND', 'ISK', 'UGX', 'XAF', 'XOF', 'PYG', 'RWF']);\nconst dp = ZERO_DP.has(home) ? 0 : 2;\nconst pow10 = (n) => 10n ** BigInt(n);\nconst roundDiv = (num, den) => (num * 2n + den) / (den * 2n); // half-up, num >= 0, den > 0\nfunction parseMoney(raw) {\n  if (raw === null || raw === undefined) return { ok: false, empty: true };\n  const s = String(raw).trim();\n  if (s === '') return { ok: false, empty: true };\n  if (!/^(\\d+|\\d{1,3}(,\\d{3})+)(\\.\\d+)?$/.test(s)) return { ok: false, empty: false };\n  const [i, f = ''] = s.replace(/,/g, '').split('.');\n  const asInt = BigInt(i + f);\n  return { ok: true, minor: f.length <= dp ? asInt * pow10(dp - f.length) : roundDiv(asInt, pow10(f.length - dp)) };\n}\nfunction frac(dec) {\n  const [i, f = ''] = String(dec).split('.');\n  return { num: BigInt(i + f), den: pow10(f.length) };\n}\nfunction parseProbability(raw) {\n  const s = String(raw ?? '').trim();\n  if (!/^\\d+(\\.\\d+)?$/.test(s)) return null;\n  const f = frac(s);\n  return f.num > f.den ? null : f;\n}\nfunction parseInstant(raw) {\n  const s = String(raw ?? '').trim();\n  if (!s) return null;\n  let ms = NaN;\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) ms = Date.parse(s + 'T00:00:00Z');\n  else if (/^\\d{12,14}$/.test(s)) ms = Number(s);\n  else if (/^\\d{4}-\\d{2}-\\d{2}T/.test(s)) ms = Date.parse(s);\n  return Number.isFinite(ms) && ms > Date.UTC(1990, 0, 1) && ms < Date.UTC(2100, 0, 1) ? ms : null;\n}\nconst fmt = (minor) => {\n  const neg = minor < 0n;\n  const m = neg ? -minor : minor;\n  const s = m.toString().padStart(dp + 1, '0');\n  return (neg ? '-' : '') + (dp ? `${s.slice(0, -dp)}.${s.slice(-dp)}` : s);\n};\nconst pct = (num, den) => (den === 0n ? null : (Number(roundDiv(num * 1000n, den)) / 10).toFixed(1));\nconst times = (num, den) => (den === 0n ? null : (Number(roundDiv(num * 100n, den)) / 100).toFixed(2));\nconst geFrac = (n1, d1, f) => n1 * f.den >= f.num * d1; // n1/d1 >= f\n\n// ---------------------------------------------------------------- days\nconst startDay = Math.floor(config.quarter.startMs / DAY);\nconst endDay = Math.floor(config.quarter.endMs / DAY);\nconst asDay = Math.min(Math.floor(config.asOf.ms / DAY), endDay);\nconst holidaySet = new Set(config.pacing.holidays.map((ms) => Math.floor(ms / DAY)));\nconst isBusiness = (d) => { const wd = new Date(d * DAY).getUTCDay(); return wd !== 0 && wd !== 6 && !holidaySet.has(d); };\nconst countDays = (from, to) => {\n  if (config.pacing.basis === 'calendar') return Math.max(0, to - from);\n  let n = 0;\n  for (let d = from; d < to; d++) if (isBusiness(d)) n++;\n  return n;\n};\nconst totalDays = countDays(startDay, endDay);\nconst elapsedDays = countDays(startDay, asDay);\nconst remainingDays = totalDays - elapsedDays;\nconst daysPerWeek = config.pacing.basis === 'calendar' ? 7n : 5n;\nconst eNum = BigInt(elapsedDays);\nconst eDen = BigInt(Math.max(1, totalDays));\nif (totalDays === 0) throw new Error('The quarter has zero pacing days (check BUSINESS_HOLIDAYS / PACING_BASIS).');\n\n// ---------------------------------------------------------------- scope\nconst inScope = (id) => (!config.scope.includeOwnerIds.length || config.scope.includeOwnerIds.includes(id)) && !config.scope.excludeOwnerIds.includes(id);\nconst ownerNames = Object.fromEntries((input.owners || []).map((o) => [String(o.id), [o.firstName, o.lastName].filter(Boolean).join(' ').trim()]));\nconst label = (id) => (config.display.repLabel === 'name' && ownerNames[id] ? ownerNames[id] : `Owner ${id}`);\nconst reps = {};\nconst rep = (id) => (reps[id] = reps[id] || { ownerId: id, quota: null, quotaParts: [], won: 0n, wonDeals: 0, weighted: 0n, openDeals: 0, pastDue: 0n, pastDueDeals: 0, flags: new Set() });\n\n// ---------------------------------------------------------------- quotas\nconst goalIssues = [];\nlet goalsUsed = 0;\nif (config.quota.source === 'env' || (config.sandboxMode && Object.keys(config.quota.map).length)) {\n  for (const [id, amt] of Object.entries(config.quota.map)) {\n    if (!inScope(id)) continue;\n    const m = parseMoney(amt);\n    if (m.ok) { rep(id).quota = (rep(id).quota || 0n) + m.minor; rep(id).quotaParts.push({ source: 'QUOTA_MAP', amount: fmt(m.minor) }); }\n  }\n} else {\n  const filter = config.quota.goalNameContains;\n  for (const g of input.goalTargets || []) {\n    const p = g.properties || {};\n    if (filter && !String(p.hs_goal_name || '').toLowerCase().includes(filter)) continue;\n    const owner = String(p.hubspot_owner_id || '').trim();\n    if (!/^\\d{1,20}$/.test(owner)) { goalIssues.push({ goalId: String(g.id), issue: 'GOAL_WITHOUT_OWNER' }); continue; }\n    if (!inScope(owner)) continue;\n    const s = parseInstant(p.hs_start_datetime);\n    const eRaw = parseInstant(p.hs_end_datetime);\n    if (s === null || eRaw === null || eRaw <= s) { goalIssues.push({ goalId: String(g.id), ownerId: owner, issue: 'INVALID_GOAL_DATES' }); rep(owner).flags.add('INVALID_GOAL'); continue; }\n    const amt = parseMoney(p.hs_target_amount);\n    if (!amt.ok) { goalIssues.push({ goalId: String(g.id), ownerId: owner, issue: 'INVALID_GOAL_AMOUNT' }); rep(owner).flags.add('INVALID_GOAL'); continue; }\n    const endEx = eRaw % 1000 === 999 ? eRaw + 1 : eRaw; // HubSpot ends goals on the last millisecond\n    const overlap = Math.min(endEx, config.quarter.endMs) - Math.max(s, config.quarter.startMs);\n    if (overlap <= 0) continue;\n    const span = endEx - s;\n    const part = overlap === span ? amt.minor : roundDiv(amt.minor * BigInt(overlap), BigInt(span));\n    const r = rep(owner);\n    r.quota = (r.quota || 0n) + part;\n    r.quotaParts.push({ goalId: String(g.id), name: String(p.hs_goal_name || '').slice(0, 80), amount: fmt(part), prorated: overlap !== span });\n    if (overlap !== span) r.flags.add('QUOTA_PRORATED');\n    goalsUsed++;\n  }\n}\n\n// ---------------------------------------------------------------- deals\nconst hygiene = [];\nconst invalid = [];\nlet outOfQuarter = 0;\nlet totalDeals = 0;\nlet unassignedWon = 0n;\nconst amountOf = (p) => {\n  let a = parseMoney(p[config.hubspot.props.amount]);\n  if (a.empty && config.hubspot.props.amount === 'amount_in_home_currency') {\n    const ccy = String(p.deal_currency_code || home).toUpperCase();\n    if (ccy === home) a = parseMoney(p.amount);\n  }\n  return a;\n};\nfunction handleDeal(d, kind) {\n  const p = d.properties || {};\n  const id = String(d.id);\n  const close = parseInstant(p.closedate);\n  totalDeals++;\n  const issues = [];\n  const owner = String(p.hubspot_owner_id || '').trim();\n  const ownerOk = /^\\d{1,20}$/.test(owner);\n  if (ownerOk && !inScope(owner)) { totalDeals--; return; }\n  if (close === null) { invalid.push({ dealId: id, kind, issue: 'INVALID_CLOSE_DATE' }); hygiene.push({ dealId: id, ownerId: owner || null, issues: ['INVALID_CLOSE_DATE'], existing: p[config.hubspot.props.hygieneFlag] || '' }); return; }\n  const closeDay = Math.floor(close / DAY);\n  if (closeDay < startDay || closeDay >= endDay) { outOfQuarter++; totalDeals--; return; }\n  const amt = amountOf(p);\n  if (!amt.ok) { invalid.push({ dealId: id, kind, issue: 'INVALID_AMOUNT' }); issues.push('INVALID_AMOUNT'); }\n  if (!ownerOk) issues.push('MISSING_OWNER');\n  if (kind === 'won' && amt.ok) {\n    if (ownerOk) { const r = rep(owner); r.won += amt.minor; r.wonDeals++; } else unassignedWon += amt.minor;\n  }\n  if (kind === 'open') {\n    const pastDue = closeDay < asDay;\n    if (pastDue) issues.push('PAST_DUE_CLOSE_DATE');\n    let prob = null;\n    if (config.pipeline.probabilitySource === 'stage_map') prob = config.pipeline.stageWeights[String(p.dealstage)] !== undefined ? frac(config.pipeline.stageWeights[String(p.dealstage)]) : null;\n    else prob = parseProbability(p.hs_deal_stage_probability);\n    if (!prob) issues.push('MISSING_PROBABILITY');\n    if (ownerOk) {\n      const r = rep(owner);\n      r.openDeals++;\n      if (pastDue && amt.ok) { r.pastDue += amt.minor; r.pastDueDeals++; r.flags.add('PAST_DUE_PIPELINE'); }\n      if (amt.ok && prob && (!pastDue || config.pipeline.weightPastDue)) r.weighted += roundDiv(amt.minor * prob.num, prob.den);\n      if (!prob) r.flags.add('MISSING_PROBABILITY');\n    }\n  }\n  if (ownerOk && issues.includes('INVALID_AMOUNT')) rep(owner).flags.add('INVALID_DEAL_AMOUNT');\n  if (issues.length) hygiene.push({ dealId: id, ownerId: ownerOk ? owner : null, kind, issues, existing: String(p[config.hubspot.props.hygieneFlag] || '') });\n}\nfor (const d of input.closedWonDeals || []) handleDeal(d, 'won');\nfor (const d of input.openDeals || []) handleDeal(d, 'open');\n\n// ---------------------------------------------------------------- metrics\nconst prev = input.previousSnapshot && input.previousSnapshot.quarterId === config.quarter.id && input.previousSnapshot.asOf < config.asOf.iso ? input.previousSnapshot : null;\nconst thAhead = frac(T.ahead), thOn = frac(T.onTrack), thRisk = frac(T.atRisk), thProj = frac(T.criticalProjection), thMin = frac(T.minElapsed), thCov = frac(T.minCoverage);\nconst early = !geFrac(eNum, eDen, thMin);\nfunction metrics(won, weighted, quota, pastDue) {\n  const m = { won: fmt(won), weighted: fmt(weighted), pastDue: fmt(pastDue), forecast: fmt(won + weighted), wonMinor: Number(won), weightedMinor: Number(weighted) };\n  m.currentWeeklyRunRate = elapsedDays > 0 ? fmt(roundDiv(won * daysPerWeek, BigInt(elapsedDays))) : null;\n  if (quota === null || quota === 0n) return { ...m, status: 'NO_QUOTA', quota: null };\n  const expected = roundDiv(quota * eNum, eDen);\n  const gap = quota > won ? quota - won : 0n;\n  const forecast = won + weighted;\n  Object.assign(m, {\n    quota: fmt(quota), expectedToDate: fmt(expected), pacingVariance: fmt(won - expected), gapToQuota: fmt(gap),\n    attainmentPct: pct(won, quota), pacingPct: pct(won, expected), projectedAttainmentPct: pct(forecast, quota),\n    coverage: gap > 0n ? times(weighted, gap) : null,\n    requiredWeeklyRunRate: gap > 0n && remainingDays > 0 ? fmt(roundDiv(gap * daysPerWeek, BigInt(remainingDays))) : gap > 0n ? null : fmt(0n),\n    quotaMinor: Number(quota), gapMinor: Number(gap),\n  });\n  m.runRateMultiple = m.requiredWeeklyRunRate !== null && won > 0n && elapsedDays > 0 ? times(gap * BigInt(elapsedDays), won * BigInt(remainingDays || 1)) : null;\n  if (won >= quota) m.status = 'QUOTA_MET';\n  else if (early) m.status = 'EARLY_QUARTER';\n  else if (expected === 0n) m.status = 'ON_TRACK';\n  else if (!geFrac(won, expected, thRisk) || !geFrac(forecast, quota, thProj)) m.status = 'CRITICAL';\n  else if (geFrac(won, expected, thAhead)) m.status = 'AHEAD';\n  else if (geFrac(won, expected, thOn)) m.status = 'ON_TRACK';\n  else m.status = 'AT_RISK';\n  m.criticalReason = m.status === 'CRITICAL' ? (!geFrac(won, expected, thRisk) ? 'PACING_BELOW_AT_RISK_THRESHOLD' : 'PROJECTED_ATTAINMENT_BELOW_THRESHOLD') : null;\n  if (gap > 0n && weighted === 0n) m.zeroPipeline = true;\n  if (gap > 0n && !geFrac(weighted, gap, thCov)) m.lowCoverage = true;\n  return m;\n}\nconst SEVERITY = ['CRITICAL', 'AT_RISK', 'NO_QUOTA', 'EARLY_QUARTER', 'ON_TRACK', 'AHEAD', 'QUOTA_MET'];\nconst repRows = Object.values(reps).map((r) => {\n  const m = metrics(r.won, r.weighted, r.quota, r.pastDue);\n  const flags = new Set(r.flags);\n  if (m.zeroPipeline) flags.add('ZERO_PIPELINE');\n  if (m.lowCoverage) flags.add('LOW_COVERAGE');\n  const p = prev && prev.reps ? prev.reps[r.ownerId] : null;\n  return {\n    ownerId: r.ownerId, label: label(r.ownerId), ...m, flags: [...flags].sort(),\n    wonDeals: r.wonDeals, openDeals: r.openDeals, pastDueDeals: r.pastDueDeals, quotaParts: r.quotaParts,\n    wow: p ? { won: fmt(r.won - BigInt(p.wonMinor || 0)), weighted: fmt(r.weighted - BigInt(p.weightedMinor || 0)) } : null,\n  };\n}).sort((a, b) => SEVERITY.indexOf(a.status) - SEVERITY.indexOf(b.status) || a.ownerId.localeCompare(b.ownerId));\n\nconst sum = (k) => Object.values(reps).reduce((s, r) => s + (r[k] || 0n), 0n);\nconst teamQuota = Object.values(reps).reduce((s, r) => s + (r.quota || 0n), 0n);\nconst teamWon = sum('won') + unassignedWon;\nconst teamWeighted = sum('weighted');\nconst team = { ...metrics(teamWon, teamWeighted, teamQuota, sum('pastDue')), reps: repRows.length, unassignedWon: fmt(unassignedWon) };\nteam.wow = prev && prev.team ? { won: fmt(teamWon - BigInt(prev.team.wonMinor || 0)), weighted: fmt(teamWeighted - BigInt(prev.team.weightedMinor || 0)) } : null;\nconst statusCounts = {};\nfor (const r of repRows) statusCounts[r.status] = (statusCounts[r.status] || 0) + 1;\n\n// ---------------------------------------------------------------- guards\nconst guardFailures = [];\nconst invalidPct = totalDeals ? (invalid.length * 100) / totalDeals : 0;\nif (invalidPct > Number(config.guards.maxInvalidRecordPct)) guardFailures.push(`${invalid.length}/${totalDeals} deals (${invalidPct.toFixed(1)}%) have invalid data, above MAX_INVALID_RECORD_PCT ${config.guards.maxInvalidRecordPct}%`);\nif (teamQuota === 0n) guardFailures.push(config.quota.source === 'env' ? 'QUOTA_MAP produced no quota for the reps in scope' : `No goal_targets matched GOAL_NAME_CONTAINS=\"${config.quota.goalNameContains}\" for this quarter`);\nif (!input.complete) guardFailures.push('Data collection was incomplete');\nif (config.configErrors.length) guardFailures.push(...config.configErrors.map((e) => `Config: ${e}`));\n\nconst snapshot = { quarterId: config.quarter.id, asOf: config.asOf.iso, reps: Object.fromEntries(repRows.map((r) => [r.ownerId, { wonMinor: r.wonMinor, weightedMinor: r.weightedMinor }])), team: { wonMinor: Number(teamWon), weightedMinor: Number(teamWeighted) } };\n\nreturn [{\n  json: {\n    quarter: config.quarter,\n    asOf: config.asOf,\n    currency: home,\n    source: input.source,\n    pacing: { basis: config.pacing.basis, totalDays, elapsedDays, remainingDays, elapsedPct: pct(eNum, eDen), early, quarterClosed: config.quarter.closed },\n    team,\n    reps: repRows,\n    statusCounts,\n    hygiene,\n    invalid,\n    goalIssues,\n    dataQuality: { totalDeals, invalidDeals: invalid.length, invalidPct: invalidPct.toFixed(1), outOfQuarterIgnored: outOfQuarter, goalsUsed, ownersLookup: input.ownersLookup },\n    previousSnapshotAsOf: prev ? prev.asOf : null,\n    snapshot,\n    guards: { passed: guardFailures.length === 0, failures: guardFailures },\n    collectionWarnings: input.collectionWarnings || [],\n  },\n}];\n"
+      },
+      "id": "58160028-385b-418b-a74c-1c8f3ba37f38",
+      "name": "Variance Calculator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2460,
+        120
+      ],
+      "notes": "Pacing, variance, gap-to-quota, run rates, weighted pipeline, coverage, status, guards. Exact BigInt money."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Notification Builder\n// Builds a Slack Block Kit message and a Microsoft Teams Adaptive Card (1.4,\n// wrapped for the Teams Workflows \"Post to a channel when a webhook request is\n// received\" trigger). CRM-sourced text is escaped / sanitised, blocks and card\n// size stay within platform limits, and reps are ordered by severity.\n// Also applies the duplicate-post guard (same quarter + as-of already posted).\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst c = $input.first().json;\nconst t = c.team;\n\nconst symbol = c.currency === 'USD' ? '$' : c.currency === 'EUR' ? '€' : c.currency === 'GBP' ? '£' : '';\nconst money = (s) => {\n  if (s === null || s === undefined) return 'n/a';\n  const n = Math.round(Number(s));\n  const abs = Math.abs(n).toLocaleString('en-US');\n  return `${n < 0 ? '-' : ''}${symbol}${abs}${symbol ? '' : ' ' + c.currency}`;\n};\nconst signed = (s) => (s === null || s === undefined ? 'n/a' : (Number(s) >= 0 ? '+' : '') + money(s));\nconst p = (s) => (s === null || s === undefined ? 'n/a' : `${s}%`);\nconst escSlack = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[*_~`]/g, '');\nconst escTeams = (s) => String(s ?? '').replace(/[[\\]()<>*_~`#]/g, '');\nconst clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);\nconst ICON = { CRITICAL: ':red_circle:', AT_RISK: ':large_orange_circle:', NO_QUOTA: ':white_circle:', EARLY_QUARTER: ':hourglass_flowing_sand:', ON_TRACK: ':large_green_circle:', AHEAD: ':rocket:', QUOTA_MET: ':trophy:' };\nconst TEAMS_COLOR = { CRITICAL: 'Attention', AT_RISK: 'Warning', NO_QUOTA: 'Default', EARLY_QUARTER: 'Default', ON_TRACK: 'Good', AHEAD: 'Good', QUOTA_MET: 'Good' };\nconst FLAG_TEXT = { ZERO_PIPELINE: 'zero weighted pipeline', LOW_COVERAGE: 'low coverage', PAST_DUE_PIPELINE: 'past-due deals', MISSING_PROBABILITY: 'missing probability', INVALID_DEAL_AMOUNT: 'invalid amount', QUOTA_PRORATED: 'quota prorated', INVALID_GOAL: 'invalid goal' };\nconst sandboxTag = c.source === 'synthetic-fixture' ? ' [SANDBOX]' : '';\nconst title = `${config.display.title}: ${c.quarter.id}${sandboxTag}`;\nconst pacingLine = `As of ${c.asOf.iso} · ${c.pacing.elapsedPct}% of the quarter elapsed (${c.pacing.elapsedDays}/${c.pacing.totalDays} ${c.pacing.basis} days)${c.pacing.quarterClosed ? ' · FINAL' : ''}${c.pacing.early ? ' · early quarter: pacing is indicative only' : ''}`;\n\nconst repLine = (r) => {\n  if (r.status === 'NO_QUOTA') return `Won ${money(r.won)} · weighted ${money(r.weighted)} · _no quota found_`;\n  const parts = [`Won ${money(r.won)} / ${money(r.quota)} (${p(r.attainmentPct)})`, `pacing ${p(r.pacingPct)} (${signed(r.pacingVariance)})`];\n  if (Number(r.gapToQuota) > 0) parts.push(`gap ${money(r.gapToQuota)}`, `need ${money(r.requiredWeeklyRunRate)}/wk${r.runRateMultiple ? ` (${r.runRateMultiple}x current)` : ''}`);\n  parts.push(`weighted ${money(r.weighted)}${r.coverage ? ` (${r.coverage}x gap)` : ''}`, `projected ${p(r.projectedAttainmentPct)}`);\n  if (r.wow) parts.push(`WoW won ${signed(r.wow.won)}`);\n  return parts.join(' · ');\n};\nconst flagsText = (r) => (r.flags.length ? ':warning: ' + r.flags.map((f) => FLAG_TEXT[f] || f.toLowerCase()).join(', ') : '');\n\n// ---------------------------------------------------------------- Slack\nconst shown = c.reps.slice(0, config.display.maxReps);\nconst counts = Object.entries(c.statusCounts).sort((a, b) => Object.keys(ICON).indexOf(a[0]) - Object.keys(ICON).indexOf(b[0])).map(([s, n]) => `${ICON[s] || ''} ${n} ${s.toLowerCase().replace(/_/g, ' ')}`).join('   ');\nconst hygCounts = {};\nfor (const h of c.hygiene) for (const i of h.issues) hygCounts[i] = (hygCounts[i] || 0) + 1;\nconst hygText = Object.keys(hygCounts).length ? `:broom: ${c.hygiene.length} deal(s) need CRM hygiene: ` + Object.entries(hygCounts).map(([k, n]) => `${n} ${k.toLowerCase().replace(/_/g, ' ')}`).join(', ') : ':broom: No CRM hygiene issues found';\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: clip(title, 150), emoji: true } },\n  { type: 'context', elements: [{ type: 'mrkdwn', text: clip(pacingLine, 300) }] },\n  { type: 'section', fields: [\n    { type: 'mrkdwn', text: `*Team quota*\\n${money(t.quota)}` },\n    { type: 'mrkdwn', text: `*Closed-won*\\n${money(t.won)} (${p(t.attainmentPct)})` },\n    { type: 'mrkdwn', text: `*Pacing vs plan*\\n${p(t.pacingPct)} (${signed(t.pacingVariance)})` },\n    { type: 'mrkdwn', text: `*Gap to quota*\\n${money(t.gapToQuota)} · need ${money(t.requiredWeeklyRunRate)}/wk` },\n    { type: 'mrkdwn', text: `*Weighted pipeline*\\n${money(t.weighted)}${t.coverage ? ` (${t.coverage}x gap)` : ''}` },\n    { type: 'mrkdwn', text: `*Forecast*\\n${money(t.forecast)} (${p(t.projectedAttainmentPct)} of quota)` },\n  ] },\n];\nif (t.wow) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Week over week (vs ${c.previousSnapshotAsOf}): closed-won ${signed(t.wow.won)} · weighted pipeline ${signed(t.wow.weighted)}` }] });\nif (counts) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: counts }] });\nblocks.push({ type: 'divider' });\nfor (const r of shown) {\n  const f = flagsText(r);\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: clip(`${ICON[r.status] || ''} *${escSlack(r.label)}* · ${r.status.replace(/_/g, ' ')}\\n${repLine(r)}${f ? '\\n' + f : ''}`, 3000) } });\n}\nif (c.reps.length > shown.length) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `+${c.reps.length - shown.length} more rep(s) not shown (MAX_REPS_IN_MESSAGE=${config.display.maxReps})` }] });\nblocks.push({ type: 'divider' });\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: clip(hygText, 2000) }] });\nif (Number(t.unassignedWon) > 0) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `:grey_question: ${money(t.unassignedWon)} closed-won has no deal owner (counted in team actuals)` }] });\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Run ${config.runId} · weighted = amount x ${config.pipeline.probabilitySource === 'stage_map' ? 'STAGE_WEIGHTS' : 'HubSpot stage probability'} for open deals closing in the rest of the quarter · figures in ${c.currency}` }] });\nif (blocks.length > 50) blocks.splice(49);\nconst slackPayload = { text: clip(`${title}: ${money(t.won)} closed-won (${p(t.attainmentPct)}), pacing ${p(t.pacingPct)}, forecast ${p(t.projectedAttainmentPct)}`, 300), blocks, unfurl_links: false };\n\n// ---------------------------------------------------------------- Teams\nconst repContainers = (list) => list.map((r) => ({\n  type: 'Container', separator: true, spacing: 'Small',\n  items: [\n    { type: 'TextBlock', wrap: true, weight: 'Bolder', color: TEAMS_COLOR[r.status] || 'Default', text: `${escTeams(r.label)}: ${r.status.replace(/_/g, ' ')}` },\n    { type: 'TextBlock', wrap: true, spacing: 'None', size: 'Small', text: repLine(r).replace(/_/g, '') + (r.flags.length ? ` · ⚠ ${r.flags.map((f) => FLAG_TEXT[f] || f.toLowerCase()).join(', ')}` : '') },\n  ],\n}));\nconst card = (list) => ({\n  type: 'message',\n  attachments: [{\n    contentType: 'application/vnd.microsoft.card.adaptive',\n    contentUrl: null,\n    content: {\n      $schema: 'http://adaptivecards.io/schemas/adaptive-card.json', type: 'AdaptiveCard', version: '1.4', msteams: { width: 'Full' },\n      body: [\n        { type: 'TextBlock', size: 'Large', weight: 'Bolder', wrap: true, text: title },\n        { type: 'TextBlock', isSubtle: true, wrap: true, spacing: 'None', text: pacingLine },\n        { type: 'FactSet', facts: [\n          { title: 'Team quota', value: money(t.quota) },\n          { title: 'Closed-won', value: `${money(t.won)} (${p(t.attainmentPct)})` },\n          { title: 'Pacing vs plan', value: `${p(t.pacingPct)} (${signed(t.pacingVariance)})` },\n          { title: 'Gap to quota', value: `${money(t.gapToQuota)}, need ${money(t.requiredWeeklyRunRate)}/wk` },\n          { title: 'Weighted pipeline', value: money(t.weighted) },\n          { title: 'Forecast', value: `${money(t.forecast)} (${p(t.projectedAttainmentPct)})` },\n          ...(t.wow ? [{ title: 'Week over week', value: `won ${signed(t.wow.won)}, weighted ${signed(t.wow.weighted)}` }] : []),\n        ] },\n        ...repContainers(list),\n        { type: 'TextBlock', wrap: true, isSubtle: true, size: 'Small', separator: true, text: hygText.replace(/:broom: /, '') },\n        { type: 'TextBlock', wrap: true, isSubtle: true, size: 'Small', text: `Run ${config.runId} · figures in ${c.currency}` },\n      ],\n    },\n  }],\n});\nlet teamsList = shown;\nlet teamsPayload = card(teamsList);\nwhile (JSON.stringify(teamsPayload).length > 25000 && teamsList.length > 1) { teamsList = teamsList.slice(0, teamsList.length - 1); teamsPayload = card(teamsList); }\n\n// ---------------------------------------------------------------- gates\nconst blockers = [...config.notify.blockers, ...c.guards.failures];\nlet alreadyPosted = false;\nif (blockers.length === 0) {\n  const sd = $getWorkflowStaticData('global');\n  const key = `${c.quarter.id}|${c.asOf.iso}`;\n  alreadyPosted = !!(sd.lastPosted && sd.lastPosted[key]);\n  if (alreadyPosted && !config.notify.forceRepost) blockers.push(`Already posted for ${key} (set FORCE_REPOST=true to post again)`);\n}\nconst textPreview = [title, pacingLine, `Team: ${money(t.won)} / ${money(t.quota)} (${p(t.attainmentPct)}), pacing ${p(t.pacingPct)}, forecast ${p(t.projectedAttainmentPct)}`, ...shown.map((r) => `- ${r.label} [${r.status}] ${repLine(r)}`)].join('\\n');\nreturn [{\n  json: {\n    notifyAllowed: blockers.length === 0,\n    notifyBlockers: blockers,\n    channels: config.notify.channels,\n    slackPayload,\n    teamsPayload,\n    textPreview,\n    sizes: { slackBlocks: blocks.length, teamsChars: JSON.stringify(teamsPayload).length, teamsReps: teamsList.length },\n  },\n}];\n"
+      },
+      "id": "693c4ca8-12ac-4a14-afb8-bcada6547aff",
+      "name": "Notification Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2680,
+        120
+      ],
+      "notes": "Slack Block Kit + Teams Adaptive Card; duplicate-post guard."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "256b5873-446b-4ef7-ae75-9bfa89040214",
+              "leftValue": "={{ $json.notifyAllowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4fdd7d3d-48c7-4524-a235-fadcb0129e1a",
+      "name": "Notify Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2900,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Dry-Run Preview  (notifications blocked)\n// ============================================================================\nconst b = $input.first().json;\nreturn [{ json: { mode: 'dry-run', notifyBlockedBy: b.notifyBlockers, channels: b.channels, sizes: b.sizes, textPreview: b.textPreview, slackPayload: b.slackPayload, teamsPayload: b.teamsPayload } }];\n"
+      },
+      "id": "c0f7833f-ced8-4e4f-a7a4-702da56ac63c",
+      "name": "Dry-Run Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Build Notification Requests  (one item per configured channel)\n// The webhook URL is NOT placed in item data; the HTTP node reads it from $env.\n// ============================================================================\nconst b = $input.first().json;\nreturn b.channels.map((channel) => ({ json: { channel, payload: channel === 'teams' ? b.teamsPayload : b.slackPayload } }));\n"
+      },
+      "id": "b6b6fba9-34e1-4317-a719-c8ede81e26f2",
+      "name": "Build Notification Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.channel === 'teams' ? $env.TEAMS_WEBHOOK_URL : $env.SLACK_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "fa6edb93-7242-4385-ad8d-e5229add788c",
+      "name": "Post Slack / Teams Update",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3340,
+        -60
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Webhook URLs read from $env only. No automatic retry: a retried post could duplicate the update."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Notification Result\n// Records the posting in workflow static data (duplicate-post guard) and saves\n// the weekly snapshot used for week-over-week deltas, only when every channel\n// accepted the message.\n// ============================================================================\nconst calc = $('Variance Calculator').first().json;\nconst reqs = $('Build Notification Requests').all().map((i) => i.json);\nconst res = $input.all().map((i) => i.json);\nconst results = reqs.map((r, i) => {\n  const x = res[i] || {};\n  const err = x.error ? String(x.error.message || x.error).slice(0, 200) : null;\n  const slackError = r.channel === 'slack' && typeof x.data === 'string' && x.data !== 'ok' ? x.data.slice(0, 100) : null;\n  return { channel: r.channel, ok: !err && !slackError, error: err || slackError };\n});\nconst allOk = results.every((r) => r.ok);\nif (allOk) {\n  const sd = $getWorkflowStaticData('global');\n  sd.lastPosted = sd.lastPosted || {};\n  sd.snapshots = sd.snapshots || {};\n  sd.lastPosted[`${calc.quarter.id}|${calc.asOf.iso}`] = new Date().toISOString();\n  sd.snapshots[calc.quarter.id] = calc.snapshot;\n  for (const k of Object.keys(sd.lastPosted).sort().slice(0, -60)) delete sd.lastPosted[k];\n}\nreturn [{ json: { mode: 'posted', allOk, results } }];\n"
+      },
+      "id": "34d45734-b636-449c-a2bf-64816ba455c1",
+      "name": "Notification Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3560,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "49c2ab2d-768a-4926-ac92-d4e4bc94bdbd",
+              "leftValue": "={{ $('Config & Safety Gate').first().json.config.hubspot.stampAllowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "36f157a5-5c1a-40a8-a4f1-d1b6a6fb5675",
+      "name": "Hygiene Stamp Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3780,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Build Hygiene Stamp Batches  (HUBSPOT_MUTATIONS_ENABLED=true, live, not dry run)\n// The ONLY CRM write: flags deals that distort the forecast (past-due close\n// date, missing probability, invalid amount, missing owner) on a custom deal\n// property. Deals whose flag already has the same value are skipped.\n// ============================================================================\nconst { config } = $('Config & Safety Gate').first().json;\nconst calc = $('Variance Calculator').first().json;\nconst P = config.hubspot.props;\nconst inputs = [];\nfor (const h of calc.hygiene) {\n  const value = [...new Set(h.issues)].sort().join(';');\n  if (h.existing === value) continue;\n  const properties = { [P.hygieneFlag]: value };\n  if (P.hygieneCheckedAt) properties[P.hygieneCheckedAt] = config.now;\n  inputs.push({ id: h.dealId, properties });\n}\nif (!inputs.length) return [{ json: { skip: true, deals: 0 } }];\nconst out = [];\nfor (let i = 0; i < inputs.length; i += 100) out.push({ json: { skip: false, url: `${config.hubspot.apiBase}/crm/v3/objects/deals/batch/update`, body: { inputs: inputs.slice(i, i + 100) }, deals: Math.min(100, inputs.length - i) } });\nreturn out;\n"
+      },
+      "id": "979b708a-37a9-45a5-ac9b-d7a3801e4fca",
+      "name": "Build Hygiene Stamp Batches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4000,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "eefd00bc-3552-4792-ac42-3479ca3513b9",
+              "leftValue": "={{ $json.skip !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "932602d1-a1a3-48eb-a399-958d1e1cc9d6",
+      "name": "Stamp Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4220,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "a6fec36b-4609-4f8a-aa3d-22a3022fd68d",
+      "name": "HubSpot: Batch Update Deal Hygiene Flags",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4440,
+        -160
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "The ONLY CRM write: forecast hygiene flag + checked-at."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Hygiene Stamp Result\n// ============================================================================\nconst plan = $('Build Hygiene Stamp Batches').all().map((i) => i.json);\nif (plan.length === 1 && plan[0].skip) return [{ json: { attempted: false, stamped: 0, failed: 0, note: 'No hygiene flags to write' } }];\nlet stamped = 0, failed = 0;\nconst errors = [];\n$input.all().map((i) => i.json).forEach((r, i) => {\n  if (r.error) { failed += plan[i] ? plan[i].deals : 0; errors.push(String(r.error.message || r.error).slice(0, 200)); return; }\n  stamped += (r.results || []).length;\n  for (const e of r.errors || []) { failed++; errors.push(String(e.message || 'error').slice(0, 200)); }\n});\nreturn [{ json: { attempted: true, stamped, failed, errors: errors.slice(0, 20) } }];\n"
+      },
+      "id": "2b76561b-e883-43e4-ab5b-d5c9c4d5a500",
+      "name": "Hygiene Stamp Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4660,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================================\n// Forecast Run Report  (terminal)\n// ============================================================================\nconst { config, safetyDecisions } = $('Config & Safety Gate').first().json;\nconst calc = $('Variance Calculator').first().json;\nconst nb = $('Notification Builder').first().json;\nlet notification = null;\ntry { notification = $('Notification Result').first().json; } catch (e) { notification = null; }\nlet hygieneStamp = null;\ntry { hygieneStamp = $('Hygiene Stamp Result').first().json; } catch (e) { hygieneStamp = null; }\nconst duplicateOnly = !nb.notifyAllowed && nb.notifyBlockers.length > 0 && nb.notifyBlockers.every((b) => /^Already posted/.test(b));\nconst status = nb.notifyAllowed ? (notification && notification.allOk ? 'POSTED' : 'POST_FAILED') : duplicateOnly ? 'SKIPPED_ALREADY_POSTED' : 'DRY_RUN';\nreturn [{\n  json: {\n    status,\n    quarter: calc.quarter.id,\n    asOf: calc.asOf.iso,\n    mode: config.sandboxMode ? 'SANDBOX' : config.dryRun ? 'LIVE / DRY-RUN' : 'LIVE',\n    pacing: calc.pacing,\n    team: { quota: calc.team.quota, won: calc.team.won, attainmentPct: calc.team.attainmentPct, pacingPct: calc.team.pacingPct, forecast: calc.team.forecast, projectedAttainmentPct: calc.team.projectedAttainmentPct, gapToQuota: calc.team.gapToQuota, status: calc.team.status },\n    statusCounts: calc.statusCounts,\n    reps: calc.reps.map((r) => ({ ownerId: r.ownerId, status: r.status, attainmentPct: r.attainmentPct || null, pacingPct: r.pacingPct || null, flags: r.flags })),\n    dataQuality: calc.dataQuality,\n    guards: calc.guards,\n    notifyBlockedBy: nb.notifyAllowed ? [] : nb.notifyBlockers,\n    notification,\n    hygieneStamp,\n    hygieneStampBlockedBy: hygieneStamp ? [] : config.hubspot.stampBlockers,\n    safetyDecisions,\n    configWarnings: config.warnings,\n    collectionWarnings: calc.collectionWarnings,\n  },\n}];\n"
+      },
+      "id": "9d3ea498-b84a-42ae-a598-2baca2ca753b",
+      "name": "Forecast Run Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4880,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forecast Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Schedule (Mon 07:47)": {
+      "main": [
+        [
+          {
+            "node": "Config & Safety Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config & Safety Gate": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Mode?": {
+      "main": [
+        [
+          {
+            "node": "Load Synthetic Quota Fixture",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Quotas From HubSpot Goals?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Synthetic Quota Fixture": {
+      "main": [
+        [
+          {
+            "node": "Normalize Forecast Inputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Quotas From HubSpot Goals?": {
+      "main": [
+        [
+          {
+            "node": "Build Goal Search",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Collect Goals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Goal Search": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Search Goal Targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Search Goal Targets": {
+      "main": [
+        [
+          {
+            "node": "Collect Goals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Goals": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Search Closed-Won Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Search Closed-Won Deals": {
+      "main": [
+        [
+          {
+            "node": "Collect Closed-Won Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Closed-Won Deals": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Search Open Pipeline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Search Open Pipeline": {
+      "main": [
+        [
+          {
+            "node": "Collect Open Pipeline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Open Pipeline": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Fetch Owners",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Fetch Owners": {
+      "main": [
+        [
+          {
+            "node": "Normalize Forecast Inputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Forecast Inputs": {
+      "main": [
+        [
+          {
+            "node": "Variance Calculator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Variance Calculator": {
+      "main": [
+        [
+          {
+            "node": "Notification Builder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notification Builder": {
+      "main": [
+        [
+          {
+            "node": "Notify Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Build Notification Requests",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dry-Run Preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Notification Requests": {
+      "main": [
+        [
+          {
+            "node": "Post Slack / Teams Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack / Teams Update": {
+      "main": [
+        [
+          {
+            "node": "Notification Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notification Result": {
+      "main": [
+        [
+          {
+            "node": "Hygiene Stamp Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry-Run Preview": {
+      "main": [
+        [
+          {
+            "node": "Hygiene Stamp Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hygiene Stamp Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Build Hygiene Stamp Batches",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Forecast Run Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Hygiene Stamp Batches": {
+      "main": [
+        [
+          {
+            "node": "Stamp Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stamp Needed?": {
+      "main": [
+        [
+          {
+            "node": "HubSpot: Batch Update Deal Hygiene Flags",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Hygiene Stamp Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot: Batch Update Deal Hygiene Flags": {
+      "main": [
+        [
+          {
+            "node": "Hygiene Stamp Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hygiene Stamp Result": {
+      "main": [
+        [
+          {
+            "node": "Forecast Run Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
