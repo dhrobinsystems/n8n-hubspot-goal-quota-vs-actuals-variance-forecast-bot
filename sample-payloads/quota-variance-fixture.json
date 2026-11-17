@@ -1,0 +1,80 @@
+{
+  "_meta": {
+    "synthetic": true,
+    "fixtureVersion": "1.0.0",
+    "description": "Fully synthetic HubSpot owners, goal_targets (quotas) and deals for offline quota-vs-actuals testing. Every name, ID, email (example.com) and amount is fictional. Shapes mirror HubSpot CRM v3 search results and the owners API.",
+    "placeholderPortalId": "99000001",
+    "quarter": "2026-Q4 (2026-10-01 to 2026-12-31, 92 days)",
+    "asOf": "2026-11-16 (46 days elapsed = exactly 50%)",
+    "expectedWithDefaults": {
+      "99100001": "AHEAD: 210k won vs 150k expected (monthly goals summed 3 x 100k)",
+      "99100002": "ON_TRACK: 120k vs 120k expected; one closed-won deal has an invalid amount",
+      "99100003": "AT_RISK: 80k vs 100k expected; one past-due open deal excluded from weighting",
+      "99100004": "CRITICAL + ZERO_PIPELINE: 30k vs 90k expected, no open pipeline",
+      "99100005": "QUOTA_MET: 160k won vs 150k quota",
+      "99100006": "NO_QUOTA: has closed-won revenue but no quota goal",
+      "99100007": "CRITICAL by projection: annual goal prorated 92/365; pacing 0.83 but projected attainment 41%",
+      "unassigned": "5k closed-won with no owner: counted in team actuals and flagged"
+    }
+  },
+  "portalId": "99000001",
+  "owners": [
+    { "id": "99100001", "firstName": "Avery", "lastName": "Rep (Mock)", "email": "avery.rep@example.com" },
+    { "id": "99100002", "firstName": "Jordan", "lastName": "Rep (Mock)", "email": "jordan.rep@example.com" },
+    { "id": "99100003", "firstName": "Riley", "lastName": "Rep (Mock)", "email": "riley.rep@example.com" },
+    { "id": "99100004", "firstName": "Morgan", "lastName": "Rep (Mock)", "email": "morgan.rep@example.com" },
+    { "id": "99100005", "firstName": "Casey", "lastName": "Rep (Mock)", "email": "casey.rep@example.com" },
+    { "id": "99100006", "firstName": "Taylor", "lastName": "Rep (Mock)", "email": "taylor.rep@example.com" },
+    { "id": "99100007", "firstName": "Quinn", "lastName": "Rep (Mock)", "email": "quinn.rep@example.com" }
+  ],
+  "goalTargets": [
+    { "id": "990030001", "properties": { "hs_goal_name": "FY2026 Sales Quota (Mock)", "hs_milestone": "monthly", "hs_target_amount": "100000", "hs_start_datetime": "2026-10-01T00:00:00.000Z", "hs_end_datetime": "2026-10-31T23:59:59.999Z", "hubspot_owner_id": "99100001" } },
+    { "id": "990030002", "properties": { "hs_goal_name": "FY2026 Sales Quota (Mock)", "hs_milestone": "monthly", "hs_target_amount": "100000", "hs_start_datetime": "2026-11-01T00:00:00.000Z", "hs_end_datetime": "2026-11-30T23:59:59.999Z", "hubspot_owner_id": "99100001" } },
+    { "id": "990030003", "properties": { "hs_goal_name": "FY2026 Sales Quota (Mock)", "hs_milestone": "monthly", "hs_target_amount": "100000", "hs_start_datetime": "2026-12-01T00:00:00.000Z", "hs_end_datetime": "2026-12-31T23:59:59.999Z", "hubspot_owner_id": "99100001" } },
+    { "id": "990030004", "properties": { "hs_goal_name": "FY2026 Sales Quota (Mock)", "hs_milestone": "monthly", "hs_target_amount": "95000", "hs_start_datetime": "2026-09-01T00:00:00.000Z", "hs_end_datetime": "2026-09-30T23:59:59.999Z", "hubspot_owner_id": "99100001" } },
+    { "id": "990030005", "properties": { "hs_goal_name": "Calls Made (Mock)", "hs_milestone": "quarterly", "hs_target_amount": "500", "hs_start_datetime": "2026-10-01T00:00:00.000Z", "hs_end_datetime": "2026-12-31T23:59:59.999Z", "hubspot_owner_id": "99100001" } },
+    { "id": "990030006", "properties": { "hs_goal_name": "Q4 New Business Quota (Mock)", "hs_milestone": "quarterly", "hs_target_amount": "240000", "hs_start_datetime": "2026-10-01T00:00:00.000Z", "hs_end_datetime": "2026-12-31T23:59:59.999Z", "hubspot_owner_id": "99100002" } },
+    { "id": "990030007", "properties": { "hs_goal_name": "Q4 New Business Quota (Mock)", "hs_milestone": "quarterly", "hs_target_amount": "200000", "hs_start_datetime": "2026-10-01T00:00:00.000Z", "hs_end_datetime": "2026-12-31T23:59:59.999Z", "hubspot_owner_id": "99100003" } },
+    { "id": "990030008", "properties": { "hs_goal_name": "Q4 New Business Quota (Mock)", "hs_milestone": "quarterly", "hs_target_amount": "180000", "hs_start_datetime": "2026-10-01T00:00:00.000Z", "hs_end_datetime": "2026-12-31T23:59:59.999Z", "hubspot_owner_id": "99100004" } },
+    { "id": "990030009", "properties": { "hs_goal_name": "Q4 New Business Quota (Mock)", "hs_milestone": "quarterly", "hs_target_amount": "150000", "hs_start_datetime": "2026-10-01T00:00:00.000Z", "hs_end_datetime": "2026-12-31T23:59:59.999Z", "hubspot_owner_id": "99100005" } },
+    { "id": "990030010", "properties": { "hs_goal_name": "2026 Annual Revenue Quota (Mock)", "hs_milestone": "annually", "hs_target_amount": "480000", "hs_start_datetime": "2026-01-01T00:00:00.000Z", "hs_end_datetime": "2026-12-31T23:59:59.999Z", "hubspot_owner_id": "99100007" } }
+  ],
+  "closedWonDeals": [
+    { "id": "990040001", "properties": { "dealname": "Acme Enterprise Corp - Expansion (Mock)", "amount": "120000", "amount_in_home_currency": "120000", "deal_currency_code": "USD", "closedate": "2026-10-14T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100001", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040002", "properties": { "dealname": "Northstar Logistics - Fleet (Mock)", "amount": "90000", "amount_in_home_currency": "90000", "deal_currency_code": "USD", "closedate": "2026-11-05T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100001", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040003", "properties": { "dealname": "Bluebird Analytics - Pro (Mock)", "amount": "120000", "amount_in_home_currency": "120000", "deal_currency_code": "USD", "closedate": "2026-10-30T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100002", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040004", "properties": { "dealname": "Pinecrest Media - Growth (Mock)", "amount": "50000", "amount_in_home_currency": "50000", "deal_currency_code": "USD", "closedate": "2026-10-08T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100003", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040005", "properties": { "dealname": "Harborview Freight - Starter (Mock)", "amount": "30000", "amount_in_home_currency": "30000", "deal_currency_code": "USD", "closedate": "2026-11-12T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100003", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040006", "properties": { "dealname": "Granite Robotics - Pilot (Mock)", "amount": "30000", "amount_in_home_currency": "30000", "deal_currency_code": "USD", "closedate": "2026-10-21T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100004", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040007", "properties": { "dealname": "Lakeside Health - Platform (Mock)", "amount": "100000", "amount_in_home_currency": "100000", "deal_currency_code": "USD", "closedate": "2026-10-02T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100005", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040008", "properties": { "dealname": "Meridian Retail - Suite (Mock)", "amount": "60000", "amount_in_home_currency": "60000", "deal_currency_code": "USD", "closedate": "2026-11-10T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100005", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040009", "properties": { "dealname": "Orbit Labs - Add-on (Mock)", "amount": "20000", "amount_in_home_currency": "20000", "deal_currency_code": "USD", "closedate": "2026-11-03T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100006", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040010", "properties": { "dealname": "Zurich Cafe Systems AG - POS (Mock)", "amount": "46000", "amount_in_home_currency": "50000", "deal_currency_code": "EUR", "closedate": "2026-10-19T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100007", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040011", "properties": { "dealname": "Cobalt Systems - Unassigned (Mock)", "amount": "5000", "amount_in_home_currency": "5000", "deal_currency_code": "USD", "closedate": "2026-10-25T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040012", "properties": { "dealname": "Ember Foods - Bad Amount (Mock)", "amount": "N/A", "amount_in_home_currency": "N/A", "deal_currency_code": "USD", "closedate": "2026-11-09T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100002", "hs_is_closed_won": "true", "hs_is_closed": "true" } },
+    { "id": "990040013", "properties": { "dealname": "Quartz Mobility - Prior Quarter (Mock)", "amount": "70000", "amount_in_home_currency": "70000", "deal_currency_code": "USD", "closedate": "2026-09-28T16:00:00.000Z", "dealstage": "closedwon", "pipeline": "default", "hubspot_owner_id": "99100001", "hs_is_closed_won": "true", "hs_is_closed": "true" } }
+  ],
+  "openDeals": [
+    { "id": "990050001", "properties": { "dealname": "Velvet Peak Apparel - Platform (Mock)", "amount": "80000", "amount_in_home_currency": "80000", "deal_currency_code": "USD", "closedate": "2026-12-10T17:00:00.000Z", "dealstage": "presentationscheduled", "pipeline": "default", "hubspot_owner_id": "99100001", "hs_deal_stage_probability": "0.6", "hs_is_closed_won": "false", "hs_is_closed": "false" } },
+    { "id": "990050002", "properties": { "dealname": "Sakura Logistics KK - Enterprise (Mock)", "amount": "150000", "amount_in_home_currency": "150000", "deal_currency_code": "USD", "closedate": "2026-12-15T17:00:00.000Z", "dealstage": "qualifiedtobuy", "pipeline": "default", "hubspot_owner_id": "99100002", "hs_deal_stage_probability": "0.4", "hs_is_closed_won": "false", "hs_is_closed": "false" } },
+    { "id": "990050003", "properties": { "dealname": "Alpine Ledger SA - Core (Mock)", "amount": "60000", "amount_in_home_currency": "60000", "deal_currency_code": "USD", "closedate": "2026-11-28T17:00:00.000Z", "dealstage": "decisionmakerboughtin", "pipeline": "default", "hubspot_owner_id": "99100002", "hs_deal_stage_probability": "0.8", "hs_is_closed_won": "false", "hs_is_closed": "false" } },
+    { "id": "990050004", "properties": { "dealname": "Ironwood Energy - Rollout (Mock)", "amount": "200000", "amount_in_home_currency": "200000", "deal_currency_code": "USD", "closedate": "2026-12-20T17:00:00.000Z", "dealstage": "99300001", "pipeline": "99200001", "hubspot_owner_id": "99100003", "hs_deal_stage_probability": "0.5", "hs_is_closed_won": "false", "hs_is_closed": "false" } },
+    { "id": "990050005", "properties": { "dealname": "Copperline Telecom - Past Due (Mock)", "amount": "40000", "amount_in_home_currency": "40000", "deal_currency_code": "USD", "closedate": "2026-11-01T17:00:00.000Z", "dealstage": "contractsent", "pipeline": "default", "hubspot_owner_id": "99100003", "hs_deal_stage_probability": "0.9", "hs_is_closed_won": "false", "hs_is_closed": "false" } },
+    { "id": "990050006", "properties": { "dealname": "Silverbrook Dental - Starter (Mock)", "amount": "50000", "amount_in_home_currency": "50000", "deal_currency_code": "USD", "closedate": "2026-12-05T17:00:00.000Z", "dealstage": "appointmentscheduled", "pipeline": "default", "hubspot_owner_id": "99100005", "hs_deal_stage_probability": "0.2", "hs_is_closed_won": "false", "hs_is_closed": "false" } },
+    { "id": "990050007", "properties": { "dealname": "Tidewater Marine - No Probability (Mock)", "amount": "70000", "amount_in_home_currency": "70000", "deal_currency_code": "USD", "closedate": "2026-12-18T17:00:00.000Z", "dealstage": "qualifiedtobuy", "pipeline": "default", "hubspot_owner_id": "99100007", "hs_deal_stage_probability": "", "hs_is_closed_won": "false", "hs_is_closed": "false" } }
+  ],
+  "previousSnapshot": {
+    "quarterId": "2026-Q4",
+    "asOf": "2026-11-09",
+    "reps": {
+      "99100001": { "wonMinor": 12000000, "weightedMinor": 9000000 },
+      "99100002": { "wonMinor": 12000000, "weightedMinor": 6000000 },
+      "99100003": { "wonMinor": 5000000, "weightedMinor": 12000000 },
+      "99100004": { "wonMinor": 3000000, "weightedMinor": 0 },
+      "99100005": { "wonMinor": 10000000, "weightedMinor": 2000000 },
+      "99100006": { "wonMinor": 0, "weightedMinor": 0 },
+      "99100007": { "wonMinor": 5000000, "weightedMinor": 0 }
+    },
+    "team": { "wonMinor": 47500000, "weightedMinor": 29000000 }
+  }
+}
